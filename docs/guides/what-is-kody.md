@@ -48,6 +48,13 @@ readable without an account. It is also plain markdown at
 `/docs/what-is-kody.md` for anything that prefers to read it raw, and the full
 docs index is at `/llms.txt`.
 
+> [!WATCH] https://www.youtube.com/watch?v=QA0xYMAMjEg Watch: Introducing Kody:
+> Your Personal Software Factory
+
+Also watch:
+[The home your agents share](https://www.youtube.com/watch?v=6PGKZDcPsvE) and
+[Personal software, connected to everything.](https://www.youtube.com/watch?v=MGOj4NwV0uk).
+
 ## What Kody is
 
 You do not chat with Kody. Your agent supplies the intelligence; Kody supplies
