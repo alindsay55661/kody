@@ -59,6 +59,16 @@ const mockModule = vi.hoisted(() => {
 		loadRelevantMemoriesForTool: vi.fn(),
 		runPackageRetrievers: vi.fn(),
 		consumeSearchRateLimit: vi.fn(async () => 'free'),
+		getUserPlan: vi.fn(async () => 'free'),
+	}
+})
+
+vi.mock('#worker/entitlements/service.ts', async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import('#worker/entitlements/service.ts')>()
+	return {
+		...actual,
+		getUserPlan: (...args: Array<unknown>) => mockModule.getUserPlan(...args),
 	}
 })
 
@@ -536,14 +546,23 @@ test('executeSearchList does not prefetch an embedding for domain-overview or in
 	expect(aiRunCount).toBe(0)
 })
 
-test('executeSearchList reuses the rate-limit plan for Jev eligibility', async () => {
-	mockModule.consumeSearchRateLimit.mockResolvedValueOnce('pro')
+test('executeSearchList reads the Jev plan fresh while the rate limit runs', async () => {
+	let releaseRateLimit!: () => void
+	const rateLimitGate = new Promise<void>((resolve) => {
+		releaseRateLimit = resolve
+	})
+	mockModule.consumeSearchRateLimit.mockImplementationOnce(async () => {
+		await rateLimitGate
+		return 'free'
+	})
+	mockModule.getUserPlan.mockClear()
+	mockModule.getUserPlan.mockResolvedValueOnce('pro')
 	mockModule.runPackageRetrievers.mockResolvedValueOnce({
 		results: [],
 		warnings: [],
 	})
 	mockModule.searchUnified.mockClear()
-	await executeSearchList({
+	const searching = executeSearchList({
 		env: { APP_DB: {}, WRANGLER_IS_LOCAL_DEV: 'true' } as unknown as Env,
 		callerContext: signedInSearchCaller(),
 		conversationId: 'conv-search-plan',
@@ -552,7 +571,34 @@ test('executeSearchList reuses the rate-limit plan for Jev eligibility', async (
 		userId: 'user-1',
 		includeHiddenPackages: false,
 	})
+	await vi.waitFor(() => {
+		expect(mockModule.getUserPlan).toHaveBeenCalledTimes(1)
+	})
+	releaseRateLimit()
+	await searching
 	expect(mockModule.searchUnified).toHaveBeenCalledWith(
+		expect.objectContaining({ jevRerankPlanEligible: true }),
+	)
+})
+
+test('executeSearchList keeps hybrid order when the fresh Jev plan read fails', async () => {
+	mockModule.getUserPlan.mockRejectedValueOnce(new Error('d1 blip'))
+	mockModule.runPackageRetrievers.mockResolvedValueOnce({
+		results: [],
+		warnings: [],
+	})
+	mockModule.searchUnified.mockClear()
+	await executeSearchList({
+		env: { APP_DB: {}, WRANGLER_IS_LOCAL_DEV: 'true' } as unknown as Env,
+		callerContext: signedInSearchCaller(),
+		conversationId: 'conv-search-plan-blip',
+		query: 'skills',
+		limit: 15,
+		userId: 'user-1',
+		includeHiddenPackages: false,
+	})
+	expect(mockModule.searchUnified).toHaveBeenCalledTimes(1)
+	expect(mockModule.searchUnified).not.toHaveBeenCalledWith(
 		expect.objectContaining({ jevRerankPlanEligible: true }),
 	)
 })
