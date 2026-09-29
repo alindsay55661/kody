@@ -290,3 +290,8 @@ runtime path if this budget is raised again.
   `buildOnboardingSearchNotice` (same pattern as waiting items). Local/CI
   dry-run platform 5_226_510 against the previous 5_226_500 budget, reviewed
   ceiling 5_227_000.
+- Repo session unified-diff line limit (KODY-8E / #2717):
+  `maxRepoSourceFileDiffLines` preflight + EFBIG remap on `applyWorkspaceEdits`
+  and MCP caller-failure classification for the stable / raw phrases. Local / CI
+  dry-run platform 5_227_844 against the previous 5_227_000 budget, reviewed
+  ceiling 5_228_000.
