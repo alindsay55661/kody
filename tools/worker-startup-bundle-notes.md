@@ -328,3 +328,10 @@ runtime path if this budget is raised again.
   by the runtime, adds 1,694 bytes to the runtime startup graph: local dry-run
   3,911,073 versus main/rc.2 at 3,909,379, against the previous 3,910,000
   budget. Reviewed ceiling 3,912,000.
+- Connect-time OAuth refresh policy (#2739): `refresh-policy.ts` inference, the
+  `not_applicable` refresh skip, `refresh_policy` mapping and stale-snapshot
+  filtering, and the `integrationTokenRefresh` `refreshed` / `skippedReason`
+  output on the integrations graph both workers already evaluate (about 890
+  bytes per worker over main). Local dry-run runtime 3_912_325 against the
+  previous 3_912_000 budget, reviewed ceiling 3_912_500; platform local dry-run
+  5_238_445 against the previous 5_238_000 budget, reviewed ceiling 5_238_500.

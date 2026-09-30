@@ -521,6 +521,7 @@ test('connect oauth saves tokens via the secret store and persists app+connectio
 			name: 'github',
 			accessToken: 'access-token',
 			refreshToken: 'refresh-token',
+			refreshPolicy: 'required',
 		}),
 	)
 	expect(mockModule.upsertIntegration).toHaveBeenCalledWith(
@@ -599,6 +600,7 @@ test('connect oauth saves tokens via the secret store and persists app+connectio
 			userId: 'stable-user-1',
 			name: 'spotify',
 			accessToken: 'newly-scoped-access-token',
+			refreshPolicy: 'not_applicable',
 		}),
 	)
 
@@ -612,7 +614,7 @@ test('connect oauth saves tokens via the secret store and persists app+connectio
 		postRequest({
 			...spotifyConnect,
 			scopes: ['user-read-playback-state'],
-			tokenPayload: { access_token: 'rotated-access-token' },
+			tokenPayload: { access_token: 'rotated-access-token', expires_in: 3600 },
 		}),
 	)
 	expect(spotifyReconnect.status).toBe(200)
@@ -625,6 +627,7 @@ test('connect oauth saves tokens via the secret store and persists app+connectio
 		expect.objectContaining({
 			name: 'spotify',
 			accessToken: 'rotated-access-token',
+			refreshPolicy: 'required',
 		}),
 	)
 
