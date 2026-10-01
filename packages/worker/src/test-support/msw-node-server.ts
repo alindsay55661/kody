@@ -2,6 +2,9 @@ import { type HttpHandler } from 'msw'
 import { setupServer } from 'msw/node'
 
 export type MswNodeServerOptions = {
+	/**
+	 * MSW v3 shared option (node `server.listen` and Workers `defineNetwork`).
+	 */
 	onUnhandledFrame?: 'error' | 'warn' | 'bypass'
 }
 
