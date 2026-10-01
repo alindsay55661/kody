@@ -2,9 +2,10 @@
 id: open_api
 title: Open API and local execute
 summary:
-  Prefer @kodycodes/cli execute --local when Node ≥22 is available. Call Kody
-  over HTTPS at api.kody.codes, mint scoped tokens from the MCP api tool or CLI,
-  and run execute modules locally with CapabilityProxy. Behind experiments
+  Prefer @kodycodes/cli execute --local when Node ≥22 is available. Agents on
+  MCP use cliCredentialBootstrap (one-shot code, no tokenCreate); interactive
+  humans use kody login; scoped kody_at_… tokens remain for CI/headless. Call
+  Kody over HTTPS at api.kody.codes with CapabilityProxy. Behind experiments
   flags; signed-in users can turn them on from this page.
 category: platform
 ---
@@ -47,10 +48,13 @@ When **Node ≥22** and `@kodycodes/cli` are available, prefer
 `npx @kodycodes/cli execute --local` for one-off modules, smoke tests, and
 composition — including modules that `import` from `kody:@owner/name` (or
 `kody:@owner/name/path`). Keep `--local`; do not switch to hosted MCP `execute`
-for package imports. Fall back to hosted MCP `execute` only when local is not
-appropriate (no suitable Node, CLI missing, flags/scopes missing, or the host
-cannot run a local workerd). Cursor Cloud Agents need `KODY_API_TOKEN` in the
-environment (not in the prompt); see
+for package imports. Agents already on MCP: `cliCredentialBootstrap` then CLI
+`auth bootstrap` (no second OAuth, no `tokenCreate`). Interactive humans:
+`kody login` once, then `--local` with no `KODY_API_TOKEN`. Scoped `kody_at_…`
+tokens remain valid for CI and other headless envs without MCP — put
+`KODY_API_TOKEN` in the environment (not in the prompt). Fall back to hosted MCP
+`execute` only when local is not appropriate (no suitable Node, CLI missing,
+flags/scopes missing, or the host cannot run a local workerd). See
 [Cursor Cloud Agent notes](../contributing/cloud-agents.md) and the
 [prefer-local-cli-execute](../../.agents/skills/prefer-local-cli-execute/SKILL.md)
 skill.
@@ -60,11 +64,11 @@ skill.
 Pure `kody.*` / `workflows.create` modules run in local workerd; each
 `kody:runtime` call is a CapabilityProxy hop. Modules with static `kody:@…`
 imports keep `--local`: the CLI calls `POST /v1/local-execute/package-graph`
-(same `local-execute` token + flag) to download published, stamped
-importable-module artifacts, embeds them next to your module + `kody:runtime`,
-and still uses CapabilityProxy only for per-call runtime hops. There is **no**
-silent whole-module defer to CapabilityProxy → `kody.execute`. Agents keep
-writing:
+(same `local-execute` flag + login OAuth or API token) to download published,
+stamped importable-module artifacts, embeds them next to your module +
+`kody:runtime`, and still uses CapabilityProxy only for per-call runtime hops.
+There is **no** silent whole-module defer to CapabilityProxy → `kody.execute`.
+Agents keep writing:
 
 ```ts
 import { searchMessages } from 'kody:@kentcdodds/google/gmail'
@@ -101,7 +105,25 @@ CLI consumer: [kody-bot/cli#13](https://github.com/kody-bot/cli/pull/13).
 
 ## First local run
 
-**Preferred when already logged in:** `kody login`, then run with no
+**Preferred for agents already on MCP:** call `cliCredentialBootstrap` (MCP
+`api` / `kody.cliCredentialBootstrap`). It returns a one-shot `kody_bc_…`
+bootstrap code and a `cli_command` — **not** a `kody_at_…`. Run the CLI command;
+the CLI redeems over HTTPS and stores the API token for `--local`. No second
+interactive OAuth and no `tokenCreate`.
+
+```json
+{
+	"operationId": "cliCredentialBootstrap",
+	"params": {}
+}
+```
+
+```bash
+npx @kodycodes/cli auth bootstrap --code 'kody_bc_…'   # from cli_command
+npx @kodycodes/cli execute --local --code 'export default async function main() { return await kody.metaGetCurrentUser({}) }'
+```
+
+**Preferred for interactive humans:** `kody login`, then run with no
 `KODY_API_TOKEN`. The CLI sends the stored MCP OAuth access token as Bearer to
 CapabilityProxy and package-graph (same `local-execute` flag).
 
@@ -110,8 +132,7 @@ npx @kodycodes/cli login   # once
 npx @kodycodes/cli execute --local --code 'export default async function main() { return await kody.metaGetCurrentUser({}) }'
 ```
 
-**Or mint a scoped API token** (agents / CI / when you want scopes thinner than
-the full MCP grant):
+**Optional — scoped API token** (CI / headless without MCP, or thinner scopes):
 
 1. With MCP `api` available, mint a short-lived token (value returned once):
 
@@ -125,10 +146,6 @@ the full MCP grant):
    }
    ```
 
-   Add scopes as needed for the work. Or from a shell already holding
-   `KODY_API_TOKEN` with `tokens:write` and `local-execute`: use the CLI / MCP
-   `api` helpers the same way. Prefer MCP `tokenCreate` for the first token.
-
 2. Export the value (do not paste it back into chat):
 
    ```bash
@@ -141,8 +158,8 @@ the full MCP grant):
    npx @kodycodes/cli execute --local --code 'export default async function main() { return await kody.metaGetCurrentUser({}) }'
    ```
 
-   Prefer the env var over `--token` so the secret is not visible in process
-   arguments. When set, `KODY_API_TOKEN` wins over `kody login`.
+   Prefer the env var over `--token`. When set, `KODY_API_TOKEN` wins over
+   `kody login` / bootstrap store.
 
 List and revoke API tokens with MCP `api` (`tokenList`, `tokenRevoke`) or the
 same operations over HTTP.
