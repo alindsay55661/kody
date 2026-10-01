@@ -348,3 +348,17 @@ runtime path if this budget is raised again.
   ceiling 3_912_700; platform 5_238_709 against the previous 5_238_600 budget,
   reviewed ceiling 5_238_800. Production `assertRestorablePackageSourceSnapshot`
   is unchanged.
+- Open API + MCP `api` tool + scoped API tokens: the platform `MCP` Durable
+  Object registers the flag-gated `api` tool, which reaches the Open API
+  operation catalog (`packages/worker/src/open-api/`, `api-tokens/`). The tool
+  loads that graph through a memoized dynamic `import()`, so esbuild wraps it
+  and nothing evaluates until the first `api` call; bytes grow, startup CPU does
+  not. Local dry-run platform 5_275_466 against the previous 5_238_500 budget,
+  reviewed ceiling 5_276_000. Runtime gains the `kody_at_` redactor on execute
+  output and the two flag registry entries: local dry-run 3_913_497 against the
+  previous 3_912_500 budget, reviewed ceiling 3_914_000. Review fixes (rotation
+  scope check, debounced sliding expiry) add about 100 platform bytes: local
+  dry-run 5_276_098, reviewed ceiling 5_276_500. Splitting CapabilityProxy
+  capability errors (per-call secret redactor) from generic platform failures
+  adds about 870 more: local dry-run 5_277_132 (5_277_389 with #2764), reviewed
+  ceiling 5_277_500.
