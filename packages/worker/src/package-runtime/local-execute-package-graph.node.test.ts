@@ -6,6 +6,7 @@ import {
 } from '#worker/test-support/module-graph.ts'
 import {
 	buildLocalExecutePackageGraph,
+	createLocalExecutePackageRuntimeModuleSource,
 	type LocalExecutePackageGraphError,
 } from './local-execute-package-graph.ts'
 
@@ -172,6 +173,26 @@ export default async function main(params) { return greet(params.name) }`
 			(module) => module.name === '.__kody_virtual__/runtime.js',
 		)?.esModule,
 	).toContain('kody:runtime')
+	const runtimeShim = graph.modules.find(
+		(module) => module.name === '.__kody_virtual__/runtime.js',
+	)?.esModule
+	expect(runtimeShim).toContain('createAuthenticatedFetch')
+	expect(runtimeShim).toContain('kody.authenticatedFetch')
+	expect(runtimeShim).toContain('bodyBase64')
+	expect(runtimeShim).toContain('__kodyNullBodyStatuses')
+	expect(runtimeShim).toContain('__kodyCreatePackageBoundAuthenticatedFetch')
+	expect(runtimeShim).toContain('__kodyCreatePackageBoundStorage')
+	expect(runtimeShim).toContain('kody.packageStorageGet')
+	expect(runtimeShim).toContain('__kodyCreatePackageBoundSecrets')
+	expect(runtimeShim).toContain('__kodySecretAuthorityPackageId')
+	const packageRuntimeModules = graph.modules.filter((module) =>
+		module.name.includes('/.__kody_virtual__/package-runtime/'),
+	)
+	for (const module of packageRuntimeModules) {
+		expect(module.esModule).toContain(
+			'__kodyCreatePackageBoundAuthenticatedFetch',
+		)
+	}
 	expect(
 		graph.modules.some((module) => module.name.startsWith('.__kody_root__/')),
 	).toBe(false)
@@ -250,4 +271,49 @@ test('buildLocalExecutePackageGraph returns an empty graph when there are no kod
 	})
 	expect(graph).toEqual({ modules: [], imports: [], warnings: [] })
 	expect(mockModule.getSavedPackageByName).not.toHaveBeenCalled()
+})
+
+test('createLocalExecutePackageRuntimeModuleSource clones frozen base before proxy overrides', () => {
+	const packageId = 'pkg-proxy-invariant'
+	const source = createLocalExecutePackageRuntimeModuleSource(packageId)
+	expect(source).toContain('Object.freeze({')
+	expect(source).toContain('...__kodyBaseRuntimeDefault')
+	expect(source).toContain(
+		`__kodyCreatePackageBoundAuthenticatedFetch(${JSON.stringify(packageId)})`,
+	)
+
+	// Regression: Proxy over a frozen base that returns different bound
+	// values throws on get. The generated module freezes a clone with the
+	// overrides so default-export access stays valid.
+	const unboundStorage = () => ({ id: 'unbound' })
+	const boundStorage = () => ({ id: `package:${packageId}` })
+	const base = Object.freeze({
+		kody: {},
+		packageStorage: unboundStorage,
+		packageSecrets: { get: async () => null },
+		createAuthenticatedFetch: async () => {
+			throw new Error('unbound')
+		},
+	})
+	const broken = new Proxy(base, {
+		get(target, property, receiver) {
+			if (property === 'packageStorage') return boundStorage
+			return Reflect.get(target, property, receiver)
+		},
+	})
+	expect(() => broken.packageStorage).toThrow(/proxy/i)
+
+	const fixed = new Proxy(
+		Object.freeze({
+			...base,
+			packageStorage: boundStorage,
+		}),
+		{
+			get(target, property, receiver) {
+				if (property === 'packageStorage') return boundStorage
+				return Reflect.get(target, property, receiver)
+			},
+		},
+	)
+	expect(fixed.packageStorage().id).toBe(`package:${packageId}`)
 })
