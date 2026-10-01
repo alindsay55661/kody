@@ -323,6 +323,51 @@ test('parseAuthoredPackageJson rejects invalid manifests with a specific error p
 			/secretName/,
 			sentryExports,
 		],
+		[
+			'@kentcdodds/sentry-bridge',
+			sentryHook({
+				challenge: {
+					type: 'subscription-challenge',
+					method: 'GET',
+					challenge: { in: 'query', key: 'crc_token' },
+					prove: {
+						kind: 'hmac',
+						secretName: 'x',
+						algorithm: 'hmac-sha256',
+						encoding: 'base64',
+					},
+					respond: { as: 'text' },
+				},
+			}),
+			/prove.kind=hmac requires respond.as=json-hmac/,
+			sentryExports,
+		],
+		[
+			'@kentcdodds/sentry-bridge',
+			sentryHook({
+				challenge: {
+					type: 'subscription-challenge',
+					method: 'POST',
+					challenge: { in: 'json', key: 'challenge' },
+					respond: { as: 'json', key: 'challenge' },
+				},
+			}),
+			/when.json/,
+			sentryExports,
+		],
+		[
+			'@kentcdodds/sentry-bridge',
+			sentryHook({
+				challenge: {
+					type: 'subscription-challenge',
+					method: 'GET',
+					challenge: { in: 'query', key: '__proto__' },
+					respond: { as: 'text' },
+				},
+			}),
+			/prototype property names|Challenge keys/,
+			sentryExports,
+		],
 	]
 	const unmatched = cases.filter(([name, kody, error, options]) => {
 		try {
@@ -539,6 +584,41 @@ test('parseAuthoredPackageJson accepts kody.webhooks with verification, replay, 
 			exportName: './activity-event',
 			verification: xVerification,
 			challenge: xChallenge,
+		},
+	])
+
+	const hubChallenge = {
+		type: 'subscription-challenge',
+		method: 'GET',
+		challenge: { in: 'query', key: 'hub.challenge' },
+		when: { query: { 'hub.mode': 'subscribe' } },
+		prove: {
+			kind: 'verify-token',
+			in: 'query',
+			key: 'hub.verify_token',
+			secretName: 'hubVerify',
+		},
+		respond: { as: 'json', key: 'hub.challenge' },
+	} as const
+	const hub = parse(
+		'@kentcdodds/activity-hub',
+		{
+			webhooks: [
+				{
+					name: 'events',
+					export: './handle-events',
+					challenge: hubChallenge,
+				},
+			],
+		},
+		{ exports: { './handle-events': './src/handle-events.ts' } },
+	)
+	expect(buildPackageSearchProjection(hub).webhooks).toEqual([
+		{
+			...webhookDefaults,
+			name: 'events',
+			exportName: './handle-events',
+			challenge: hubChallenge,
 		},
 	])
 })
