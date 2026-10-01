@@ -51,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     name: 🧹 Static
     timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
     if: >-
       github.event_name != 'pull_request' || github.event.pull_request.draft ==
       false
@@ -114,6 +117,10 @@ jobs:
 
       - name: 📦 Worker startup bundles
         if: ${{ !cancelled() }}
+        env:
+          # Main pushes may open/update a tracking issue when a reviewed
+          # startup byte budget is exceeded. Overage never fails this step.
+          GH_TOKEN: ${{ github.token }}
         run: npm run worker-startup-bundles:check
 
       - name: ⏱️ Worker startup time
