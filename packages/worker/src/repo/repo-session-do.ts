@@ -29,6 +29,7 @@ import {
 	resolveArtifactSourceRepo,
 } from './artifacts.ts'
 import { buildSentryOptions } from '#worker/sentry-options.ts'
+import { bytesToSnapshotString } from '#universal/package-file-media.ts'
 import {
 	getEntitySourceById,
 	markEntitySourcePendingExternalReconcile,
@@ -789,13 +790,15 @@ class RepoSessionBase extends DurableObject<Env> {
 		const rootPrefix = `${root.replace(/\/+$/, '')}/`
 		const files: Record<string, string> = {}
 		for (const entry of entries) {
-			const content = await this.workspace.readFile(entry.path)
+			// Raw bytes — UTF-8 `readFile` replaces invalid sequences with
+			// U+FFFD (PNG `0x89` → `0xFD`), which then poisons `/_assets`.
+			const bytes = await this.workspace.readFileBytes(entry.path)
 			// Treat an unreadable file as a hard failure so the caller aborts
 			// and triggers rollback instead of persisting a KV snapshot that
 			// is silently missing files. A null read here usually means the
 			// file was unlinked between glob and read, which means the tree
 			// we are about to publish is not the tree we scanned.
-			if (content == null) {
+			if (bytes == null) {
 				throw new Error(
 					`Failed to read repo session file "${entry.path}" while collecting workspace snapshot.`,
 				)
@@ -803,17 +806,23 @@ class RepoSessionBase extends DurableObject<Env> {
 			const relativePath = entry.path.startsWith(rootPrefix)
 				? entry.path.slice(rootPrefix.length)
 				: entry.path
-			files[relativePath] = content
+			files[relativePath] = bytesToSnapshotString(bytes, relativePath)
 		}
 		return files
 	}
 
 	private async computeTreeHash(root = repoSessionWorkspacePrefix) {
 		const entries = await this.listWorkspaceFileEntries(root)
+		const rootPrefix = `${root.replace(/\/+$/, '')}/`
 		const chunks: Array<string> = []
 		for (const entry of entries) {
-			const content = await this.workspace.readFile(entry.path)
-			chunks.push(`${entry.path}\n${content ?? ''}\n`)
+			const bytes = await this.workspace.readFileBytes(entry.path)
+			const relativePath = entry.path.startsWith(rootPrefix)
+				? entry.path.slice(rootPrefix.length)
+				: entry.path
+			const content =
+				bytes == null ? '' : bytesToSnapshotString(bytes, relativePath)
+			chunks.push(`${entry.path}\n${content}\n`)
 		}
 		const data = new TextEncoder().encode(chunks.join(''))
 		const digest = await crypto.subtle.digest('SHA-256', data)
@@ -3193,6 +3202,12 @@ class RepoSessionBase extends DurableObject<Env> {
 		}
 		const runId = crypto.randomUUID()
 		const publishDir = publishClone.dir || externalPublishWorkspaceDir
+		// Always collect a binary-safe snapshot before publish. Do not skip this
+		// based on the pre-clone D1 row: a concurrent snapshot-failure revert can
+		// clear published_commit so publishFromExternalRef still finalizes, and
+		// falling back to UTF-8 checks.sourceFiles would corrupt PNG magic.
+		// Checks still walk the workspace via UTF-8 readFile for validation only.
+		const snapshotFiles = await publishClone.collectFiles()
 		const publishResult = await publishExternalRefSource({
 			env: this.env,
 			sourceId: source.id,
@@ -3207,6 +3222,7 @@ class RepoSessionBase extends DurableObject<Env> {
 			allowForce: input.allowForce,
 			destructiveOverwriteConfirmed: input.destructiveOverwriteConfirmed,
 			workspace: publishClone.workspace,
+			files: snapshotFiles,
 			baseUrl: input.baseUrl ?? source.source_root,
 			manifestPath: resolveRepoWorkspacePath(source.manifest_path, publishDir),
 			sourceRoot: resolveRepoWorkspacePath(
@@ -3232,7 +3248,7 @@ class RepoSessionBase extends DurableObject<Env> {
 					publishResult.published_commit &&
 					hasPublishedRuntimeArtifacts(this.env)
 				) {
-					const files = await publishClone.collectFiles()
+					const files = snapshotFiles
 					if (typeof files[source.manifest_path] === 'string') {
 						const existingSnapshot = await loadPublishedSourceSnapshot({
 							env: this.env,

@@ -42,7 +42,10 @@ export function createExternalClone(headCommit: string) {
 			symlink: vi.fn(async () => undefined),
 		},
 		isAncestorCommit: vi.fn(async () => true),
-		collectFiles: vi.fn(async () => ({})),
+		collectFiles: vi.fn(async () => ({
+			'package.json': '{"name":"@kody/demo"}',
+			'index.ts': 'export const ready = true\n',
+		})),
 	}
 }
 
@@ -108,6 +111,12 @@ export const repoSessionMockModule = (() => {
 
 	const workspaceFiles = new Map<string, string>()
 
+	const workspaceReadFile = vi.fn<Workspace['readFile']>(
+		async (path) =>
+			workspaceFiles.get(path) ??
+			'{"version":1,"kind":"job","entrypoint":"src/job.ts"}',
+	)
+
 	return {
 		git,
 		gitState,
@@ -126,11 +135,12 @@ export const repoSessionMockModule = (() => {
 			async (path) => path === '/session/.git/config',
 		),
 		workspaceFiles,
-		workspaceReadFile: vi.fn<Workspace['readFile']>(
-			async (path) =>
-				workspaceFiles.get(path) ??
-				'{"version":1,"kind":"job","entrypoint":"src/job.ts"}',
-		),
+		workspaceReadFile,
+		workspaceReadFileBytes: vi.fn<Workspace['readFileBytes']>(async (path) => {
+			const text = await workspaceReadFile(path)
+			if (text == null) return null
+			return new TextEncoder().encode(text)
+		}),
 		workspaceWriteFile: vi.fn<Workspace['writeFile']>(async () => undefined),
 		workspaceWriteFileBytes: vi.fn<Workspace['writeFileBytes']>(
 			async () => undefined,
@@ -263,6 +273,7 @@ export function restoreRepoSessionMockBaseline() {
 	for (const mock of [
 		...Object.values(mocks.git),
 		mocks.workspaceReadFile,
+		mocks.workspaceReadFileBytes,
 		mocks.workspaceWriteFile,
 		mocks.workspaceWriteFileBytes,
 		mocks.workspaceMkdir,
@@ -297,6 +308,11 @@ export function restoreRepoSessionMockBaseline() {
 	mocks.deleteStorageBucketInventory.mockClear()
 
 	mocks.workspaceExists.mockResolvedValue(false)
+	mocks.workspaceReadFileBytes.mockImplementation(async (path) => {
+		const text = await mocks.workspaceReadFile(path)
+		if (text == null) return null
+		return new TextEncoder().encode(text)
+	})
 	mocks.cloneExternalPublishWorkspace.mockImplementation(async () =>
 		createExternalClone(gitState.headCommit),
 	)
