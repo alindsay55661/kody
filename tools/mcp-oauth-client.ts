@@ -17,6 +17,10 @@ export type OAuthClientRegistration = {
 	redirectUri: string
 }
 
+export type AppMcpOAuthSession = OAuthClientRegistration & {
+	accessToken: string
+}
+
 export type McpConnection = {
 	client: Client
 	transport: StreamableHTTPClientTransport
@@ -233,6 +237,82 @@ export async function closeMcpConnection(input: McpConnection) {
 	await input.transport.close().catch(() => undefined)
 }
 
+export async function resolveAppMcpAuth(
+	origin: string,
+	user: AppAuthUser,
+	options: {
+		clientName?: string
+		fetchImpl?: FetchLike
+		cookieHeader?: string
+		oauth?: AppMcpOAuthSession
+	} = {},
+): Promise<{ cookieHeader: string; oauth: AppMcpOAuthSession }> {
+	if (options.cookieHeader && options.oauth) {
+		return {
+			cookieHeader: options.cookieHeader,
+			oauth: options.oauth,
+		}
+	}
+
+	const fetchImpl = options.fetchImpl ?? fetch
+	let cookieHeader =
+		options.cookieHeader ?? (await loginToApp(origin, user, fetchImpl))
+	const clientRegistration = options.oauth
+		? {
+				clientId: options.oauth.clientId,
+				clientSecret: options.oauth.clientSecret,
+				redirectUri: options.oauth.redirectUri,
+			}
+		: await registerOAuthClient(origin, {
+				clientName: options.clientName,
+				fetchImpl,
+			})
+	try {
+		return {
+			cookieHeader,
+			oauth: {
+				...clientRegistration,
+				accessToken: await mintAccessToken(
+					origin,
+					clientRegistration,
+					cookieHeader,
+					fetchImpl,
+				),
+			},
+		}
+	} catch (error) {
+		if (!options.cookieHeader) throw error
+		cookieHeader = await loginToApp(origin, user, fetchImpl)
+		return {
+			cookieHeader,
+			oauth: {
+				...clientRegistration,
+				accessToken: await mintAccessToken(
+					origin,
+					clientRegistration,
+					cookieHeader,
+					fetchImpl,
+				),
+			},
+		}
+	}
+}
+
+async function mintAccessToken(
+	origin: string,
+	client: OAuthClientRegistration,
+	cookieHeader: string,
+	fetchImpl: FetchLike,
+) {
+	const code = await authorizeOAuthClient(
+		origin,
+		client,
+		cookieHeader,
+		fetchImpl,
+	)
+	return exchangeAuthorizationCode(origin, client, code, fetchImpl)
+}
+
 export async function connectAppMcpClient(
 	origin: string,
 	user: AppAuthUser,
@@ -240,26 +320,11 @@ export async function connectAppMcpClient(
 		extraHeaders?: Record<string, string>
 		clientName?: string
 		fetchImpl?: FetchLike
+		cookieHeader?: string
+		oauth?: AppMcpOAuthSession
 	} = {},
 ) {
-	const fetchImpl = options.fetchImpl ?? fetch
-	const cookieHeader = await loginToApp(origin, user, fetchImpl)
-	const clientRegistration = await registerOAuthClient(origin, {
-		clientName: options.clientName,
-		fetchImpl,
-	})
-	const code = await authorizeOAuthClient(
-		origin,
-		clientRegistration,
-		cookieHeader,
-		fetchImpl,
-	)
-	const accessToken = await exchangeAuthorizationCode(
-		origin,
-		clientRegistration,
-		code,
-		fetchImpl,
-	)
+	const session = await resolveAppMcpAuth(origin, user, options)
 	// Preview and production Workers are multi-isolate: the legacy
 	// sessionful SDK v1 client initializes, then hangs on the next request.
 	// Pin the stateless 2026-07-28 lane so each tool call is self-contained.
@@ -269,7 +334,7 @@ export async function connectAppMcpClient(
 		const connected = await connectStatelessMcpClient(
 			origin,
 			{
-				Authorization: `Bearer ${accessToken}`,
+				Authorization: `Bearer ${session.oauth.accessToken}`,
 				...options.extraHeaders,
 			},
 			{ name: options.clientName ?? defaultControlKodyClientName },
@@ -277,11 +342,19 @@ export async function connectAppMcpClient(
 		client = connected.client
 		transport = connected.transport
 	} catch (error) {
+		if (options.cookieHeader || options.oauth) {
+			return connectAppMcpClient(origin, user, {
+				extraHeaders: options.extraHeaders,
+				clientName: options.clientName,
+				fetchImpl: options.fetchImpl,
+			})
+		}
 		const detail = error instanceof Error ? error.message : String(error)
 		throw new Error(mcpAccountRejectedMessage(detail))
 	}
 	return {
-		cookieHeader,
+		cookieHeader: session.cookieHeader,
+		oauth: session.oauth,
 		client,
 		async [Symbol.asyncDispose]() {
 			await client.close().catch(() => undefined)
