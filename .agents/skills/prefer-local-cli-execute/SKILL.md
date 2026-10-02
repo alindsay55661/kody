@@ -16,9 +16,11 @@ For one-off modules, authenticated smoke tests, and composition, prefer the
 local CLI when **Node ≥22** and `@kodycodes/cli` are available. Do **not** use
 hosted MCP `execute`.
 
-Canonical guide: [Open API and local execute](https://kody.codes/docs/open-api)
-(`search({ entity: "guide:open_api" })` or
-[docs/guides/open-api.md](../../../docs/guides/open-api.md)).
+Canonical guide: [Local CLI execute](https://kody.codes/docs/local-execute)
+(`search({ entity: "guide:local_execute" })` or
+[docs/guides/local-execute.md](../../../docs/guides/local-execute.md)). Open API
+fallback: [Open API and local execute](https://kody.codes/docs/open-api)
+(`guide:open_api`).
 
 ## Agents already on MCP: bootstrap (no second OAuth)
 
@@ -59,8 +61,8 @@ npx @kodycodes/cli login   # once per machine
 npx @kodycodes/cli execute --local --code '…'
 ```
 
-CapabilityProxy and package-graph accept that OAuth Bearer when `local-execute`
-is on (ADR 0055).
+CapabilityProxy and package-graph accept that OAuth Bearer (ADR 0055). API
+tokens still need the `local-execute` scope; CLI login OAuth does not.
 
 ## CLI credential priority
 
@@ -105,11 +107,11 @@ export default async function main(params) { return await searchMessages(params)
 ```
 
 The CLI downloads stamped modules via Open API
-`POST /v1/local-execute/package-graph` (same `local-execute` flag + login OAuth
-or API token) and embeds them in local workerd. CapabilityProxy stays for
-per-call `kody:runtime` hops only. Package-graph rewrites inlined virtual
-runtime preambles onto the CapabilityProxy shim so Dropbox-style published
-bundles get a callable `createAuthenticatedFetch` under `--local`. See
+`POST /v1/local-execute/package-graph` (API tokens need `local-execute` scope;
+CLI login OAuth does not) and embeds them in local workerd. CapabilityProxy
+stays for per-call `kody:runtime` hops only. Package-graph rewrites inlined
+virtual runtime preambles onto the CapabilityProxy shim so Dropbox-style
+published bundles get a callable `createAuthenticatedFetch` under `--local`. See
 [Open API and local execute](../../../docs/guides/open-api.md).
 
 ## Fallback

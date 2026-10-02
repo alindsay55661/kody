@@ -1,7 +1,6 @@
 import { type ToolAnnotations } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { redactApiTokens } from '@kody-internal/shared/api-token-format.ts'
-import { resolveCallerFeatureFlags } from '#mcp/capabilities/access-control.ts'
 import {
 	defaultExecutionResponseLimitBytes,
 	formatLimitedExecutionOutput,
@@ -9,7 +8,6 @@ import {
 } from '#mcp/executor.ts'
 import { type McpRegistrationAgent } from '#mcp/mcp-registration-agent.ts'
 import { callerContextFields, logMcpEvent } from '#mcp/observability.ts'
-import { mcpApiToolFlagKey } from '#universal/feature-flags/registry.ts'
 import { createApiInvocationContext } from '#worker/open-api/context.ts'
 import { ApiError, toApiError } from '#worker/open-api/errors.ts'
 import type * as OpenApiInvoke from '#worker/open-api/invoke.ts'
@@ -38,7 +36,7 @@ export const apiToolDescription = [
 	'',
 	'Use `execute` instead when you need to compose several calls, transform results, or fetch external URLs.',
 	'',
-	"Prefer local CLI execute when Node ≥22 and `@kodycodes/cli` are available. Agents already on this MCP session: call `cliCredentialBootstrap` (returns a one-shot `kody_bc_…` code + `cli_command`, never a `kody_at_…`), run that CLI command, then `npx @kodycodes/cli execute --local --code '…'` — no second interactive OAuth and no `tokenCreate`. Interactive humans: `kody login` then `--local`. Mint `tokenCreate` only for CI/headless without an MCP session (set `KODY_API_TOKEN` in the environment, never paste into chat). If `--local` cannot run, use Open API / MCP `api` or fix the environment. See https://kody.codes/docs/open-api.",
+	"Prefer local CLI execute when Node ≥22 and `@kodycodes/cli` are available. Agents already on this MCP session: call `cliCredentialBootstrap` (returns a one-shot `kody_bc_…` code + `cli_command`, never a `kody_at_…`), run that CLI command, then `npx @kodycodes/cli execute --local --code '…'` — no second interactive OAuth and no `tokenCreate`. Interactive humans: `kody login` then `--local`. Mint `tokenCreate` only for CI/headless without an MCP session (set `KODY_API_TOKEN` in the environment, never paste into chat). If `--local` cannot run, use Open API / MCP `api` or fix the environment. See https://kody.codes/docs/local-execute and https://kody.codes/docs/open-api.",
 ].join('\n')
 
 export const apiToolAnnotations = {
@@ -69,28 +67,9 @@ export const apiToolOutputSchema = {
 	note: z.string().optional().describe('Explains a truncated result.'),
 }
 
-function apiToolUnavailableError() {
-	return new ApiError({
-		status: 404,
-		code: 'feature_unavailable',
-		message:
-			'The api tool is not enabled for this account. Use search and execute instead.',
-		details: { feature_flag: mcpApiToolFlagKey },
-	})
-}
-
-/**
- * Register the MCP `api` tool when the caller has `mcp-api-tool`. The flag
- * is re-checked on every call so a flag turned off mid-session stops the tool
- * even on long-lived sessions that registered it earlier.
- */
+/** Register the MCP `api` tool for signed-in callers. */
 export async function registerApiTool(agent: McpRegistrationAgent) {
 	const env = agent.getEnv()
-	const featureFlags = await resolveCallerFeatureFlags(
-		env,
-		agent.getCallerContext(),
-	)
-	if (featureFlags[mcpApiToolFlagKey] !== true) return
 	const icons = buildKodyToolIcons(agent.getCallerContext().baseUrl)
 	agent.server.registerTool(
 		'api',
@@ -141,8 +120,6 @@ export async function registerApiTool(agent: McpRegistrationAgent) {
 						message: 'The api tool requires a signed-in Kody user.',
 					})
 				}
-				const flags = await resolveCallerFeatureFlags(env, callerContext)
-				if (flags[mcpApiToolFlagKey] !== true) throw apiToolUnavailableError()
 				const { invokeApiOperation } = await loadOpenApiInvoke()
 				const result = await invokeApiOperation({
 					operationId,

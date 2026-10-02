@@ -15,13 +15,10 @@ const signedInSession: session.SessionInfo = {
 	permissions: [],
 	featureFlags: {
 		'demo-indicator': false,
-		'compact-mcp-server-instructions': false,
 		'package-share-grants': false,
 		'secret-providers': false,
 		'jev-search-rerank': false,
 		'execute-invoke': false,
-		'mcp-api-tool': false,
-		'local-execute': false,
 	},
 }
 
