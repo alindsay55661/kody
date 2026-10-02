@@ -193,6 +193,15 @@ export default async function main(params) { return greet(params.name) }`
 	expect(runtimeShim).toContain('kody.packageStorageGet')
 	expect(runtimeShim).toContain('__kodyCreatePackageBoundSecrets')
 	expect(runtimeShim).toContain('__kodySecretAuthorityPackageId')
+	expect(runtimeShim).toContain('secretHeaders')
+	expect(runtimeShim).toContain('oauthClientCredentials')
+	expect(runtimeShim).toContain('kody.oauthClientCredentials')
+	expect(runtimeShim).toContain('{{secret-basic:')
+	// Shim owns secretHeaders / oauthClientCredentials — do not re-export the
+	// CLI host's intentional `undefined` placeholders.
+	expect(runtimeShim).not.toMatch(
+		/import \{[\s\S]*secretHeaders[\s\S]*\} from ["']\.\.\/kody:runtime["']/,
+	)
 	const packageRuntimeModules = graph.modules.filter((module) =>
 		module.name.includes('/.__kody_virtual__/package-runtime/'),
 	)
@@ -204,6 +213,127 @@ export default async function main(params) { return greet(params.name) }`
 	expect(
 		graph.modules.some((module) => module.name.startsWith('.__kody_root__/')),
 	).toBe(false)
+})
+
+test('buildLocalExecutePackageGraph rewrites inlined virtual runtime onto the CapabilityProxy shim', async () => {
+	mockModule.getSavedPackageByName.mockResolvedValue(createSavedPackageRecord())
+	mockModule.loadPackageSourceBySourceId.mockResolvedValue(
+		makeLoadedSource({
+			exports: { './smoke-test': './src/smoke-test.ts' },
+			files: {
+				'src/smoke-test.ts': `import { createAuthenticatedFetch } from 'kody:runtime'
+export default async function smokeTest() { return typeof createAuthenticatedFetch }`,
+			},
+		}),
+	)
+	const packageId = '2cc996d8-c0f5-4339-a6c1-9b6206123e96'
+	mockModule.loadPublishedBundleArtifactByIdentity.mockResolvedValue(
+		makeArtifactHit({
+			artifactName: './smoke-test',
+			entryPoint: 'src/smoke-test.ts',
+			mainModule: 'dist/smoke-test.js',
+			modules: {
+				'dist/smoke-test.js': `// virtual:.__kody_virtual__/runtime.js
+import { AsyncLocalStorage } from "node:async_hooks";
+var __kodyRuntimeStorage = new AsyncLocalStorage();
+var __kodyInitialRuntime = __kodyRuntimeStorage.getStore();
+function __kodyOptionalRuntimeFunctionExport(exportName) {
+  if (__kodyInitialRuntime === void 0) return void 0;
+  return () => {};
+}
+function __kodyCreatePackageBoundStorage(id) { return () => ({ id }); }
+function __kodyCreatePackageBoundSecrets(id) { return { get: async () => "", has: async () => false }; }
+var createAuthenticatedFetch = __kodyOptionalRuntimeFunctionExport("createAuthenticatedFetch");
+var runtime_default = { createAuthenticatedFetch };
+// virtual:.__kody_virtual__/package-runtime/abc.js
+var packageStorage2 = __kodyCreatePackageBoundStorage(${JSON.stringify(packageId)});
+var packageSecrets2 = __kodyCreatePackageBoundSecrets(${JSON.stringify(packageId)});
+// virtual:.__kody_root__/src/smoke-test.ts
+export default async function smokeTest() {
+  return typeof createAuthenticatedFetch;
+}
+`,
+				'.__kody_virtual__/runtime.js':
+					'export function createAuthenticatedFetch() { throw new Error("stale") }',
+			},
+		}),
+	)
+
+	const graph = await buildLocalExecutePackageGraph({
+		...graphInput,
+		code: `import smokeTest from 'kody:@kentcdodds/example-package/smoke-test'
+export default async function main() { return await smokeTest() }`,
+	})
+
+	const bundle = graph.modules.find((module) =>
+		module.name.endsWith('/dist/smoke-test.js'),
+	)
+	expect(bundle).toBeDefined()
+	expect(bundle?.esModule).toContain(
+		'__kodyCreatePackageBoundAuthenticatedFetch',
+	)
+	expect(bundle?.esModule).toContain(JSON.stringify(packageId))
+	expect(bundle?.esModule).not.toContain(
+		'__kodyOptionalRuntimeFunctionExport("createAuthenticatedFetch")',
+	)
+	expect(bundle?.esModule).toContain(
+		'// virtual:.__kody_root__/src/smoke-test.ts',
+	)
+})
+
+test('createLocalExecuteRuntimeShimSource exposes a fixed local host-binding inventory', () => {
+	const shim = createLocalExecuteRuntimeShimSource(runtimeModulePath)
+	const requiredCallableExports = [
+		'createAuthenticatedFetch',
+		'oauthClientCredentials',
+		'__kodyCreatePackageBoundAuthenticatedFetch',
+		'__kodyCreatePackageBoundStorage',
+		'__kodyCreatePackageBoundSecrets',
+		'__kodyCreatePackageBoundOauthClientCredentials',
+		'packageStorage',
+	] as const
+	for (const name of requiredCallableExports) {
+		expect(shim).toMatch(
+			new RegExp(`(export (async )?function|export const) ${name}\\b`),
+		)
+	}
+	expect(shim).toMatch(/export const secretHeaders = \{/)
+	expect(shim).toMatch(/export const packageSecrets = \{/)
+	expect(shim).toContain('kody.authenticatedFetch')
+	expect(shim).toContain('kody.oauthClientCredentials')
+	expect(shim).toContain('kody.packageStorageGet')
+	expect(shim).toContain('kody.packageSecretGet')
+})
+
+test('local secretHeaders.basic parses opaque {{secret:…}} refs like cloud', () => {
+	const shim = createLocalExecuteRuntimeShimSource(runtimeModulePath)
+	const start = shim.indexOf('const __kodyParseSecretNameOrPlaceholder')
+	const end = shim.indexOf('// Client-credentials grants need host-side')
+	expect(start).toBeGreaterThan(-1)
+	expect(end).toBeGreaterThan(start)
+	const helpersSource = shim
+		.slice(start, end)
+		.replace('export const secretHeaders', 'const secretHeaders')
+	const secretHeaders = new Function(
+		`${helpersSource}; return secretHeaders;`,
+	)()
+	expect(
+		secretHeaders.basic({
+			usernameSecret: '{{secret:paypalClientId|scope=user}}',
+			passwordSecret: '{{secret:paypalClientSecret|scope=user}}',
+		}),
+	).toBe(
+		'{{secret-basic:username=paypalClientId,password=paypalClientSecret|scope=user}}',
+	)
+	expect(
+		secretHeaders.basic({
+			usernameSecret: 'paypalClientId',
+			passwordSecret: 'paypalClientSecret',
+			scope: 'user',
+		}),
+	).toBe(
+		'{{secret-basic:username=paypalClientId,password=paypalClientSecret|scope=user}}',
+	)
 })
 
 test('createLocalExecuteRuntimeShimSource uses a relative host import from path-like module names', () => {

@@ -20,6 +20,7 @@ import {
 	isKodyRuntimeModulePath,
 	parsePackageRuntimeModulePathPackageId,
 } from './runtime-source-modules.ts'
+import { rewriteInlinedLocalExecuteBundleSource } from './rewrite-inlined-local-runtime.ts'
 import { collectStaticKodyPackageImportsFromFiles } from './static-kody-imports.ts'
 
 /** Host module name the CLI registers in local workerd (`localWorkerModuleNames.runtime`). */
@@ -166,6 +167,22 @@ export async function buildLocalExecutePackageGraph(input: {
 		)
 	}
 
+	// Dropbox-style published bundles inline `.__kody_virtual__/runtime.js`.
+	// Rewrite those preambles onto the CapabilityProxy shim so --local does
+	// not depend on cloud's ALS preload (kody#2810 residual / inlined CAF).
+	for (const [modulePath, source] of [...modulesByName.entries()]) {
+		if (isKodyRuntimeModulePath(modulePath)) continue
+		if (parsePackageRuntimeModulePathPackageId(modulePath) != null) continue
+		const rewritten = rewriteInlinedLocalExecuteBundleSource({
+			modulePath,
+			source,
+			primaryRuntimePath,
+		})
+		if (rewritten.rewritten) {
+			modulesByName.set(modulePath, rewritten.source)
+		}
+	}
+
 	const modules = [...modulesByName.entries()]
 		.sort(([left], [right]) => left.localeCompare(right))
 		.map(([name, esModule]) => ({ name, esModule }))
@@ -304,8 +321,6 @@ export function createLocalExecuteRuntimeShimSource(
 	return `
 import {
 	kody,
-	secretHeaders,
-	oauthClientCredentials,
 	packageContext,
 	email,
 	workflows,
@@ -316,14 +331,101 @@ import {
 
 export {
 	kody,
-	secretHeaders,
-	oauthClientCredentials,
 	packageContext,
 	email,
 	workflows,
 	packages,
 	events,
 };
+
+// Pure placeholder builders — same shape as cloud execute helpers (including
+// {{secret:…}} opaque refs from packageSecrets.get). Ambient local fetch does
+// not expand them; pair with createAuthenticatedFetch for secret-bearing calls.
+const __kodyParseSecretNameOrPlaceholder = (value, fieldName) => {
+	const trimmed = String(value ?? "").trim();
+	if (!trimmed) {
+		throw new Error(\`secretHeaders.basic requires \${fieldName}.\`);
+	}
+	if (trimmed.startsWith("{{") && trimmed.endsWith("}}")) {
+		const match =
+			/^\\{\\{secret:([a-zA-Z0-9._-]+)(?:\\|scope=(session|package|user))?\\}}$/.exec(
+				trimmed,
+			);
+		if (!match) {
+			throw new Error(
+				\`\${fieldName} must be a saved secret name or a single {{secret:…}} opaque ref.\`,
+			);
+		}
+		const scope = match[2];
+		return {
+			name: match[1],
+			scope:
+				scope === "package" || scope === "session" || scope === "user"
+					? scope
+					: null,
+		};
+	}
+	if (!/^[a-zA-Z0-9._-]+$/.test(trimmed)) {
+		throw new Error(
+			\`\${fieldName} must be a saved secret name using letters, numbers, dots, underscores, or hyphens, or a single {{secret:…}} opaque ref.\`,
+		);
+	}
+	return { name: trimmed, scope: null };
+};
+const __kodyNormalizeOptionalSecretScope = (scope) => {
+	if (scope == null) return null;
+	if (scope === "package" || scope === "session" || scope === "user") return scope;
+	throw new Error(\`Unsupported secret scope "\${scope}".\`);
+};
+const __kodyResolveBasicAuthSecretScope = (input) => {
+	const explicit = __kodyNormalizeOptionalSecretScope(input.explicitScope);
+	if (explicit != null) return explicit;
+	const usernameScope = input.usernameScope;
+	const passwordScope = input.passwordScope;
+	if (usernameScope == null) return passwordScope;
+	if (passwordScope == null) return usernameScope;
+	if (usernameScope !== passwordScope) {
+		throw new Error(
+			"usernameSecret and passwordSecret opaque refs disagree on scope. Pass scope explicitly or use matching refs.",
+		);
+	}
+	return usernameScope;
+};
+export const secretHeaders = {
+	basic(input) {
+		const username = __kodyParseSecretNameOrPlaceholder(
+			input?.usernameSecret,
+			"usernameSecret",
+		);
+		const password = __kodyParseSecretNameOrPlaceholder(
+			input?.passwordSecret,
+			"passwordSecret",
+		);
+		const scope = __kodyResolveBasicAuthSecretScope({
+			explicitScope: input?.scope,
+			usernameScope: username.scope,
+			passwordScope: password.scope,
+		});
+		return scope
+			? \`{{secret-basic:username=\${username.name},password=\${password.name}|scope=\${scope}}}\`
+			: \`{{secret-basic:username=\${username.name},password=\${password.name}}}\`;
+	},
+};
+
+// Client-credentials grants need host-side secret expansion — hop through
+// CapabilityProxy so long-lived secret values never enter local workerd.
+export async function oauthClientCredentials(input) {
+	return await kody.oauthClientCredentials(input ?? {});
+}
+
+export function __kodyCreatePackageBoundOauthClientCredentials(packageId) {
+	return async function oauthClientCredentials(input) {
+		return await kody.oauthClientCredentials({
+			...(input ?? {}),
+			packageId,
+		});
+	};
+}
 
 const __kodyNullBodyStatuses = new Set([204, 205, 304]);
 
@@ -541,13 +643,14 @@ export function createLocalExecutePackageRuntimeModuleSource(
 ) {
 	const baseRuntimeSpecifier = '../runtime.js'
 	return `
-export { kody, secretHeaders, oauthClientCredentials, packageContext, email, workflows, packages, events } from ${JSON.stringify(
+export { kody, secretHeaders, packageContext, email, workflows, packages, events } from ${JSON.stringify(
 		baseRuntimeSpecifier,
 	)};
 import __kodyBaseRuntimeDefault, {
 	__kodyCreatePackageBoundStorage,
 	__kodyCreatePackageBoundSecrets,
 	__kodyCreatePackageBoundAuthenticatedFetch,
+	__kodyCreatePackageBoundOauthClientCredentials,
 } from ${JSON.stringify(baseRuntimeSpecifier)};
 export const packageStorage = __kodyCreatePackageBoundStorage(${JSON.stringify(
 		packageId,
@@ -558,22 +661,28 @@ export const packageSecrets = __kodyCreatePackageBoundSecrets(${JSON.stringify(
 export const createAuthenticatedFetch = __kodyCreatePackageBoundAuthenticatedFetch(${JSON.stringify(
 		packageId,
 	)});
+export const oauthClientCredentials = __kodyCreatePackageBoundOauthClientCredentials(${JSON.stringify(
+		packageId,
+	)});
 // Local base runtime default is Object.freeze'd. Proxying that frozen target
 // while returning different packageStorage / packageSecrets /
-// createAuthenticatedFetch values violates Proxy invariants and throws on
-// default-export property access. Clone with the bound overrides first.
+// createAuthenticatedFetch / oauthClientCredentials values violates Proxy
+// invariants and throws on default-export property access. Clone with the
+// bound overrides first.
 const __kodyPackageRuntimeDefault = new Proxy(
 	Object.freeze({
 		...__kodyBaseRuntimeDefault,
 		packageStorage,
 		packageSecrets,
 		createAuthenticatedFetch,
+		oauthClientCredentials,
 	}),
 	{
 		get(target, property, receiver) {
 			if (property === "packageStorage") return packageStorage;
 			if (property === "packageSecrets") return packageSecrets;
 			if (property === "createAuthenticatedFetch") return createAuthenticatedFetch;
+			if (property === "oauthClientCredentials") return oauthClientCredentials;
 			return Reflect.get(target, property, receiver);
 		},
 		has(target, property) {
@@ -581,6 +690,7 @@ const __kodyPackageRuntimeDefault = new Proxy(
 				property === "packageStorage" ||
 				property === "packageSecrets" ||
 				property === "createAuthenticatedFetch" ||
+				property === "oauthClientCredentials" ||
 				Reflect.has(target, property)
 			);
 		},

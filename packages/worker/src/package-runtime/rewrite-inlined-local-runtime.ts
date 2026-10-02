@@ -1,0 +1,523 @@
+import { parseModuleSource, type ModuleAstNode } from '#worker/module-source.ts'
+import {
+	createRelativeImportSpecifier,
+	normalizeWorkspaceModulePath,
+} from './module-graph-paths.ts'
+
+/**
+ * Published importable-module artifacts sometimes esbuild-inline
+ * `.__kody_virtual__/runtime.js` (and the per-package runtime facade) into the
+ * bundle. Those inlined helpers capture
+ * `AsyncLocalStorage.getStore()` at module evaluation time via
+ * `__kodyOptionalRuntimeFunctionExport`. Cloud execute imports the bundle
+ * inside `__kodyRunInRuntime`, so the store is populated; CLI `execute --local`
+ * evaluates modules without that ALS entry, leaving `createAuthenticatedFetch`
+ * (and siblings) as permanent `undefined`.
+ *
+ * Google-style artifacts keep an external `./.__kody_virtual__/runtime.js`
+ * import and already work under --local via the CapabilityProxy shim. Dropbox-
+ * style inlined artifacts need this rewrite: strip the inlined virtual runtime
+ * / package-runtime sections and bind the same shim factories the
+ * external-import path uses. Author modules (including `.__kody_root__/`
+ * dependencies that appear before or after those sections) are preserved.
+ */
+
+const virtualRuntimeMarker = '// virtual:.__kody_virtual__/runtime.js'
+const virtualPackageRuntimeMarker =
+	'// virtual:.__kody_virtual__/package-runtime/'
+const virtualBannerPattern = /^\/\/ virtual:[^\n]*/gm
+
+const optionalCreateAuthenticatedFetchPattern =
+	/__kodyOptionalRuntimeFunctionExport\(\s*["']createAuthenticatedFetch["']\s*\)/
+
+const packageBoundStoragePattern =
+	/__kodyCreatePackageBoundStorage\(\s*["']([^"']+)["']\s*\)/g
+
+export function moduleSourceHasInlinedKodyRuntime(source: string) {
+	return (
+		source.includes(virtualRuntimeMarker) ||
+		optionalCreateAuthenticatedFetchPattern.test(source)
+	)
+}
+
+/**
+ * When `source` inlines the virtual runtime, replace those sections with
+ * imports/bindings from the local-execute primary runtime shim. Returns the
+ * original source when no rewrite is needed or the runtime sections cannot be
+ * identified safely (CLI ALS install remains the fallback for those shapes).
+ */
+export function rewriteInlinedLocalExecuteBundleSource(input: {
+	modulePath: string
+	source: string
+	primaryRuntimePath: string
+}): { source: string; rewritten: boolean; packageId: string | null } {
+	if (!moduleSourceHasInlinedKodyRuntime(input.source)) {
+		return { source: input.source, rewritten: false, packageId: null }
+	}
+
+	const sections = splitVirtualSections(input.source)
+	const removable = sections.filter((section) =>
+		isRemovableRuntimeSection(section.banner),
+	)
+	if (removable.length === 0) {
+		return { source: input.source, rewritten: false, packageId: null }
+	}
+
+	const preambleSource = removable.map((section) => section.source).join('')
+	const retained = sections
+		.filter((section) => !isRemovableRuntimeSection(section.banner))
+		.map((section) => section.source)
+		.join('')
+	const authorBindings = collectTopLevelBindingNames(retained)
+	if (authorBindings == null) {
+		// Retained author source is not parseable as a module; refuse rather
+		// than emit aliases that might collide with undetectable bindings.
+		return { source: input.source, rewritten: false, packageId: null }
+	}
+	const packageId = readInlinedPackageId(preambleSource)
+	const bindingNames = readInlinedBindingNames(preambleSource)
+	const relativeShim = createRelativeImportSpecifier(
+		normalizeWorkspaceModulePath(input.modulePath),
+		normalizeWorkspaceModulePath(input.primaryRuntimePath),
+	)
+	const preamble = createInlinedRuntimeReplacementPreamble({
+		relativeShimSpecifier: relativeShim,
+		packageId,
+		bindingNames,
+		authorBindings,
+	})
+
+	// Walk sections in order: keep author modules where they were, emit the
+	// shim once at the first removed runtime/package-runtime section.
+	const parts: Array<string> = []
+	let emittedPreamble = false
+	for (const section of sections) {
+		if (isRemovableRuntimeSection(section.banner)) {
+			if (!emittedPreamble) {
+				parts.push(preamble)
+				emittedPreamble = true
+			}
+			continue
+		}
+		parts.push(section.source)
+	}
+	if (!emittedPreamble) parts.unshift(preamble)
+	return {
+		source: parts.join('\n\n'),
+		rewritten: true,
+		packageId,
+	}
+}
+
+type VirtualSection = {
+	banner: string | null
+	start: number
+	end: number
+	source: string
+}
+
+function splitVirtualSections(source: string): Array<VirtualSection> {
+	const matches = [...source.matchAll(virtualBannerPattern)]
+	if (matches.length === 0) {
+		return [{ banner: null, start: 0, end: source.length, source }]
+	}
+	const sections: Array<VirtualSection> = []
+	const firstIndex = matches[0]?.index ?? 0
+	if (firstIndex > 0) {
+		sections.push({
+			banner: null,
+			start: 0,
+			end: firstIndex,
+			source: source.slice(0, firstIndex),
+		})
+	}
+	for (let i = 0; i < matches.length; i += 1) {
+		const match = matches[i]
+		if (!match) continue
+		const start = match.index ?? 0
+		const end = matches[i + 1]?.index ?? source.length
+		sections.push({
+			banner: match[0] ?? null,
+			start,
+			end,
+			source: source.slice(start, end),
+		})
+	}
+	return sections
+}
+
+function isRemovableRuntimeSection(banner: string | null) {
+	if (!banner) return false
+	return (
+		banner === virtualRuntimeMarker ||
+		banner.startsWith(virtualPackageRuntimeMarker)
+	)
+}
+
+/**
+ * Prefer the last package-bound storage id in the removed preamble. Published
+ * graphs can inline dependency package-runtime facades before the root
+ * package's facade; the root (last) id is the one author entry code should use.
+ */
+function readInlinedPackageId(preambleSource: string) {
+	const matches = [...preambleSource.matchAll(packageBoundStoragePattern)]
+	return matches.at(-1)?.[1] ?? null
+}
+
+function readAssignmentBindingName(preambleSource: string, rhsPattern: RegExp) {
+	const match = new RegExp(
+		`(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${rhsPattern.source}`,
+	).exec(preambleSource)
+	return match?.[1] ?? null
+}
+
+function readLastAssignmentBindingName(
+	preambleSource: string,
+	rhsPattern: RegExp,
+) {
+	const matches = [
+		...preambleSource.matchAll(
+			new RegExp(
+				`(?:var|let|const)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${rhsPattern.source}`,
+				'g',
+			),
+		),
+	]
+	return matches.at(-1)?.[1] ?? null
+}
+
+/**
+ * Esbuild renames colliding inlined bindings (`packageStorage` →
+ * `packageStorage2`). Author code after the cut references those renamed
+ * identifiers, so the replacement preamble must reuse the same names.
+ */
+export function readInlinedBindingNames(preambleSource: string) {
+	const packageStorage =
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyCreatePackageBoundStorage\s*\(/,
+		) ?? 'packageStorage'
+	const packageSecrets =
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyCreatePackageBoundSecrets\s*\(/,
+		) ?? 'packageSecrets'
+	const createAuthenticatedFetch =
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyOptionalRuntimeFunctionExport\s*\(\s*["']createAuthenticatedFetch["']/,
+		) ??
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyCreatePackageBoundAuthenticatedFetch\s*\(/,
+		) ??
+		'createAuthenticatedFetch'
+	const oauthClientCredentials =
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyOptionalRuntimeFunctionExport\s*\(\s*["']oauthClientCredentials["']/,
+		) ??
+		readAssignmentBindingName(
+			preambleSource,
+			/__kodyCreatePackageBoundOauthClientCredentials\s*\(/,
+		) ??
+		'oauthClientCredentials'
+	const packageRuntimeDefault =
+		readLastAssignmentBindingName(
+			preambleSource,
+			/new\s+Proxy\s*\(\s*runtime_default\s*,/,
+		) ?? null
+	// Prefer the package-runtime facade freeze (last match) over the shared
+	// runtime `KodyRuntime = Object.freeze({ defaultValue: runtime_default })`.
+	const kodyRuntime =
+		readLastAssignmentBindingName(
+			preambleSource,
+			/Object\.freeze\s*\(\s*\{\s*defaultValue:\s*(?:__kodyPackageRuntimeDefault|[A-Za-z_$][\w$]*)/,
+		) ?? null
+	return {
+		packageStorage,
+		packageSecrets,
+		createAuthenticatedFetch,
+		oauthClientCredentials,
+		packageRuntimeDefault,
+		kodyRuntime,
+	}
+}
+
+function getBindingIdentifierName(node: unknown): string | null {
+	if (!node || typeof node !== 'object') return null
+	const candidate = node as { name?: unknown; value?: unknown }
+	if (typeof candidate.name === 'string') return candidate.name
+	if (typeof candidate.value === 'string') return candidate.value
+	return null
+}
+
+function collectPatternBoundNames(node: unknown, names: Set<string>) {
+	if (!node || typeof node !== 'object') return
+	const typedNode = node as ModuleAstNode
+	switch (typedNode.type) {
+		case 'Identifier': {
+			const name = getBindingIdentifierName(typedNode)
+			if (name) names.add(name)
+			return
+		}
+		case 'ObjectPattern': {
+			const properties = (typedNode as { properties?: unknown }).properties
+			if (!Array.isArray(properties)) return
+			for (const property of properties) {
+				if (!property || typeof property !== 'object') continue
+				const typedProperty = property as ModuleAstNode
+				if (typedProperty.type === 'RestElement') {
+					collectPatternBoundNames(
+						(typedProperty as { argument?: unknown }).argument,
+						names,
+					)
+					continue
+				}
+				collectPatternBoundNames(
+					(typedProperty as { value?: unknown }).value,
+					names,
+				)
+			}
+			return
+		}
+		case 'ArrayPattern': {
+			const elements = (typedNode as { elements?: unknown }).elements
+			if (!Array.isArray(elements)) return
+			for (const element of elements) {
+				collectPatternBoundNames(element, names)
+			}
+			return
+		}
+		case 'AssignmentPattern': {
+			collectPatternBoundNames((typedNode as { left?: unknown }).left, names)
+			return
+		}
+		case 'RestElement': {
+			collectPatternBoundNames(
+				(typedNode as { argument?: unknown }).argument,
+				names,
+			)
+			return
+		}
+		default:
+			return
+	}
+}
+
+/**
+ * Top-level value bindings in retained author source. Returns `null` when the
+ * source cannot be parsed (caller should refuse the rewrite).
+ */
+function collectTopLevelBindingNames(source: string): Set<string> | null {
+	if (!source.trim()) return new Set()
+	try {
+		const parsed = parseModuleSource(source) as unknown as ModuleAstNode
+		const program = parsed.program as
+			| { body?: Array<ModuleAstNode> }
+			| undefined
+		const body =
+			program?.body ?? (parsed.body as Array<ModuleAstNode> | undefined)
+		if (!Array.isArray(body)) return new Set()
+		const names = new Set<string>()
+		for (const statement of body) {
+			if (!statement || typeof statement !== 'object') continue
+			const node = statement as ModuleAstNode & {
+				declaration?: ModuleAstNode | null
+				specifiers?: Array<ModuleAstNode>
+				id?: unknown
+				declarations?: Array<{ id?: unknown }>
+			}
+			if (node.type === 'ImportDeclaration') {
+				for (const specifier of node.specifiers ?? []) {
+					const local = getBindingIdentifierName(
+						(specifier as { local?: unknown }).local,
+					)
+					if (local) names.add(local)
+				}
+				continue
+			}
+			if (
+				node.type === 'FunctionDeclaration' ||
+				node.type === 'ClassDeclaration'
+			) {
+				const name = getBindingIdentifierName(node.id)
+				if (name) names.add(name)
+				continue
+			}
+			if (node.type === 'VariableDeclaration') {
+				for (const declarator of node.declarations ?? []) {
+					collectPatternBoundNames(declarator.id, names)
+				}
+				continue
+			}
+			if (node.type === 'ExportNamedDeclaration' && node.declaration) {
+				const declaration = node.declaration
+				if (
+					declaration.type === 'FunctionDeclaration' ||
+					declaration.type === 'ClassDeclaration'
+				) {
+					const name = getBindingIdentifierName(
+						(declaration as { id?: unknown }).id,
+					)
+					if (name) names.add(name)
+					continue
+				}
+				if (declaration.type === 'VariableDeclaration') {
+					for (const declarator of (
+						declaration as { declarations?: Array<{ id?: unknown }> }
+					).declarations ?? []) {
+						collectPatternBoundNames(declarator.id, names)
+					}
+				}
+			}
+		}
+		return names
+	} catch {
+		return null
+	}
+}
+
+function emitCanonicalAlias(
+	canonical: string,
+	actual: string,
+	authorBindings: ReadonlySet<string>,
+) {
+	if (actual === canonical) return ''
+	// Author code may already bind the canonical name (e.g. a local helper
+	// named `packageStorage`). Emitting `var packageStorage = packageStorage2`
+	// would then SyntaxError or shadow incorrectly — skip the alias.
+	if (authorBindings.has(canonical)) return ''
+	return `var ${canonical} = ${actual};`
+}
+
+function createInlinedRuntimeReplacementPreamble(input: {
+	relativeShimSpecifier: string
+	packageId: string | null
+	bindingNames: ReturnType<typeof readInlinedBindingNames>
+	authorBindings: ReadonlySet<string>
+}) {
+	const shim = JSON.stringify(input.relativeShimSpecifier)
+	const {
+		packageStorage,
+		packageSecrets,
+		createAuthenticatedFetch,
+		oauthClientCredentials,
+		packageRuntimeDefault,
+		kodyRuntime,
+	} = input.bindingNames
+
+	const facadeDefaultObject = `{
+	createAuthenticatedFetch: ${createAuthenticatedFetch},
+	oauthClientCredentials: ${oauthClientCredentials},
+	packageStorage: ${packageStorage},
+	packageSecrets: ${packageSecrets},
+	secretHeaders,
+	kody,
+	packageContext,
+	email,
+	workflows,
+	packages,
+	events,
+}`
+	const facadeLines: Array<string> = []
+	if (packageRuntimeDefault) {
+		facadeLines.push(`var ${packageRuntimeDefault} = ${facadeDefaultObject};`)
+		if (packageRuntimeDefault !== '__kodyPackageRuntimeDefault') {
+			facadeLines.push(
+				`var __kodyPackageRuntimeDefault = ${packageRuntimeDefault};`,
+			)
+		}
+	}
+	if (kodyRuntime) {
+		const defaultValueExpr = packageRuntimeDefault ?? facadeDefaultObject
+		facadeLines.push(
+			`var ${kodyRuntime} = Object.freeze({ defaultValue: ${defaultValueExpr} });`,
+		)
+		if (
+			kodyRuntime !== 'KodyRuntime' &&
+			!input.authorBindings.has('KodyRuntime')
+		) {
+			facadeLines.push(`var KodyRuntime = ${kodyRuntime};`)
+		}
+	}
+	const facadeBlock = facadeLines.filter(Boolean).join('\n')
+
+	if (input.packageId) {
+		const packageIdLiteral = JSON.stringify(input.packageId)
+		const aliases = [
+			emitCanonicalAlias(
+				'packageStorage',
+				packageStorage,
+				input.authorBindings,
+			),
+			emitCanonicalAlias(
+				'packageSecrets',
+				packageSecrets,
+				input.authorBindings,
+			),
+			emitCanonicalAlias(
+				'createAuthenticatedFetch',
+				createAuthenticatedFetch,
+				input.authorBindings,
+			),
+			emitCanonicalAlias(
+				'oauthClientCredentials',
+				oauthClientCredentials,
+				input.authorBindings,
+			),
+		]
+			.filter(Boolean)
+			.join('\n')
+		return `
+import {
+	kody,
+	secretHeaders,
+	packageContext,
+	email,
+	workflows,
+	packages,
+	events,
+	__kodyCreatePackageBoundAuthenticatedFetch,
+	__kodyCreatePackageBoundStorage,
+	__kodyCreatePackageBoundSecrets,
+	__kodyCreatePackageBoundOauthClientCredentials,
+} from ${shim};
+
+var ${createAuthenticatedFetch} = __kodyCreatePackageBoundAuthenticatedFetch(${packageIdLiteral});
+var ${packageStorage} = __kodyCreatePackageBoundStorage(${packageIdLiteral});
+var ${packageSecrets} = __kodyCreatePackageBoundSecrets(${packageIdLiteral});
+var ${oauthClientCredentials} = __kodyCreatePackageBoundOauthClientCredentials(${packageIdLiteral});
+${aliases}
+${facadeBlock}
+`.trim()
+	}
+
+	// Unstamped inlined runtime (rare): import shim helpers under stable local
+	// aliases, then expose whatever esbuild names the author body still uses.
+	return `
+import {
+	kody,
+	createAuthenticatedFetch as __kodyShimCreateAuthenticatedFetch,
+	secretHeaders,
+	oauthClientCredentials as __kodyShimOauthClientCredentials,
+	packageContext,
+	packageStorage as __kodyShimPackageStorage,
+	packageSecrets as __kodyShimPackageSecrets,
+	email,
+	workflows,
+	packages,
+	events,
+} from ${shim};
+
+var ${createAuthenticatedFetch} = __kodyShimCreateAuthenticatedFetch;
+var ${oauthClientCredentials} = __kodyShimOauthClientCredentials;
+var ${packageStorage} = __kodyShimPackageStorage;
+var ${packageSecrets} = __kodyShimPackageSecrets;
+${emitCanonicalAlias('createAuthenticatedFetch', createAuthenticatedFetch, input.authorBindings)}
+${emitCanonicalAlias('oauthClientCredentials', oauthClientCredentials, input.authorBindings)}
+${emitCanonicalAlias('packageStorage', packageStorage, input.authorBindings)}
+${emitCanonicalAlias('packageSecrets', packageSecrets, input.authorBindings)}
+${facadeBlock}
+`.trim()
+}
