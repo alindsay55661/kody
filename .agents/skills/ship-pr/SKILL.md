@@ -120,8 +120,9 @@ is open.
 
 File leftovers that meet the bar with `kody:@kentcdodds/friction-log/file` via
 prefer-local CLI execute when available
-([prefer-local-cli-execute](../prefer-local-cli-execute/SKILL.md)); else hosted
-MCP `execute`. Always pass required
+([prefer-local-cli-execute](../prefer-local-cli-execute/SKILL.md)). If `--local`
+cannot run, use hosted MCP `execute` for this package export (Open API / MCP
+`api` cannot invoke it). Always pass required
 `target: { host: 'github' | 'kody', repo: string }` plus `items` (one papercut
 each). Include `whatHappened`, `whatYouWanted`, `howToReproduce`, and `cost`
 when known. Platform leftovers use
