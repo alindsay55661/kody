@@ -1,4 +1,7 @@
-import { redactApiTokens } from '@kody-internal/shared/api-token-format.ts'
+import {
+	redactKodyCredentials,
+	redactKodyCredentialsDeep,
+} from '@kody-internal/shared/api-token-format.ts'
 import {
 	getErrorCauseChain,
 	getErrorMessage,
@@ -78,8 +81,10 @@ export class ApiError extends Error {
 		return {
 			error: {
 				code: this.code,
-				message: redactApiTokens(this.message),
-				...(this.details === undefined ? {} : { details: this.details }),
+				message: redactKodyCredentials(this.message),
+				...(this.details === undefined
+					? {}
+					: { details: redactKodyCredentialsDeep(this.details) }),
 			},
 		}
 	}
