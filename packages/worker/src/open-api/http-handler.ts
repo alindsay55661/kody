@@ -108,16 +108,17 @@ async function handleOperation(input: {
 		}
 	}
 	const startedAt = Date.now()
+	const matchedOperation = match.operation
 
 	// ADR 0056: CLI bootstrap redeem is code-authenticated only (no Bearer).
-	if (isCliCredentialBootstrapRedeemOperation(match.operation)) {
+	if (isCliCredentialBootstrapRedeemOperation(matchedOperation)) {
 		if (input.request.headers.get('Authorization')) {
 			throw invalidRequest(
 				'Do not send Authorization on bootstrap redeem; the one-shot code is the credential.',
 			)
 		}
 		const resolved = resolveApiOperation(
-			match.operation,
+			matchedOperation,
 			await getStaticRegistry(),
 		)
 		const params = await readOperationParams({
@@ -154,7 +155,7 @@ async function handleOperation(input: {
 				{
 					userId: redeemed.userId,
 					eventType: 'api_call',
-					entityId: match.operation.operationId,
+					entityId: matchedOperation.operationId,
 					durationMs: Date.now() - startedAt,
 					outcome: 'success',
 				},
@@ -164,6 +165,30 @@ async function handleOperation(input: {
 		return json(redeemed.token)
 	}
 
+	function recordCapabilityProxyObservation(observation: {
+		userId: string
+		failureCode: string
+	}) {
+		if (!isCapabilityProxyOperation(matchedOperation)) return
+		input.waitUntil(
+			recordUsage(
+				input.env,
+				{
+					userId: observation.userId,
+					eventType: 'api_call',
+					entityId: capabilityProxyObservationEntityId({
+						baseEntityId: matchedOperation.operationId,
+						outcome: 'error',
+						failureCode: observation.failureCode,
+					}),
+					durationMs: Date.now() - startedAt,
+					outcome: 'error',
+				},
+				{ waitUntil: input.waitUntil },
+			),
+		)
+	}
+
 	let ctx
 	try {
 		ctx = await authenticateApiRequest({
@@ -171,43 +196,38 @@ async function handleOperation(input: {
 			// CLI `kody login` OAuth is accepted only on local-execute routes
 			// (CapabilityProxy + package-graph). Other Open API ops stay
 			// `kody_at_`-only (ADR 0053/0055).
-			allowMcpOauth: isCapabilityProxyOperation(match.operation),
+			allowMcpOauth: isCapabilityProxyOperation(matchedOperation),
 		})
 	} catch (error) {
 		const apiError = toApiError(error)
-		if (
-			isCapabilityProxyOperation(match.operation) &&
-			apiError instanceof ApiError &&
-			apiError.meteringUserId
-		) {
-			const usage = recordUsage(
-				input.env,
-				{
-					userId: apiError.meteringUserId,
-					eventType: 'api_call',
-					entityId: capabilityProxyObservationEntityId({
-						baseEntityId: match.operation.operationId,
-						outcome: 'error',
-						failureCode: apiError.code,
-					}),
-					durationMs: Date.now() - startedAt,
-					outcome: 'error',
-				},
-				{ waitUntil: input.waitUntil },
-			)
-			input.waitUntil(usage)
+		if (apiError instanceof ApiError && apiError.meteringUserId) {
+			recordCapabilityProxyObservation({
+				userId: apiError.meteringUserId,
+				failureCode: apiError.code,
+			})
 		}
 		throw error
 	}
 	const resolved = resolveApiOperation(
-		match.operation,
+		matchedOperation,
 		await getStaticRegistry(),
 	)
-	// CapabilityProxy flag/scope failures meter inside invokeApiOperation so
-	// operators can tell session start from feature_disabled / insufficient_scope.
-	if (!isCapabilityProxyOperation(match.operation)) {
-		await assertNativeOperationEnabled(ctx, match.operation)
+	// Flag/scope before param parse so disabled/unscoped tokens get 403
+	// feature_disabled / insufficient_scope instead of 400 parse errors.
+	// CapabilityProxy preflight failures meter here (one event); invoke still
+	// meters the hop after params are accepted.
+	try {
+		await assertNativeOperationEnabled(ctx, matchedOperation)
 		assertApiScope(ctx, resolved.scope)
+	} catch (error) {
+		const apiError = toApiError(error)
+		if (apiError instanceof ApiError) {
+			recordCapabilityProxyObservation({
+				userId: ctx.callerContext.user.userId,
+				failureCode: apiError.code,
+			})
+		}
+		throw error
 	}
 	const params = await readOperationParams({
 		request: input.request,
@@ -218,7 +238,7 @@ async function handleOperation(input: {
 	const userId = ctx.callerContext.user.userId
 	const run = () =>
 		invokeApiOperation({
-			operationId: match.operation.operationId,
+			operationId: matchedOperation.operationId,
 			params,
 			ctx,
 		})
@@ -232,7 +252,7 @@ async function handleOperation(input: {
 		await withAccountWriteLease({
 			db: input.env.APP_DB,
 			stableUserId: userId,
-			holder: `api:${match.operation.operationId}`,
+			holder: `api:${matchedOperation.operationId}`,
 			env: input.env,
 			write: run,
 		}),
