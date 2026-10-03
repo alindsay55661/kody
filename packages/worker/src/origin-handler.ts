@@ -45,6 +45,7 @@ import { normalizeRedirectTo } from '#app/auth-redirect.ts'
 import { checkAuthRateLimit } from '#app/rate-limit.ts'
 import { getRequestIp } from '#worker/audit-log.ts'
 import { discardUnreadRequestBody } from '#worker/request-body.ts'
+import { isRecord } from '@kody-internal/shared/is-record.ts'
 import { handleCapabilityReindexRequest } from './capability-maintenance.ts'
 import { handleExecuteSmokeRequest } from './execute-maintenance.ts'
 import {
@@ -495,6 +496,12 @@ function addOAuthDiscoveryCorsHeaders(
 	})
 }
 
+function isMcpResourceOwnedPath(pathname: string) {
+	return (
+		pathname === mcpResourcePath || pathname.startsWith(`${mcpResourcePath}/`)
+	)
+}
+
 function isOAuthProviderOwnedPath(pathname: string) {
 	return (
 		pathname === oauthPaths.token ||
@@ -502,8 +509,7 @@ function isOAuthProviderOwnedPath(pathname: string) {
 		pathname === oauthPaths.discovery ||
 		pathname === protectedResourceMetadataPath ||
 		pathname.startsWith(`${protectedResourceMetadataPath}/`) ||
-		pathname === mcpResourcePath ||
-		pathname.startsWith(`${mcpResourcePath}/`)
+		isMcpResourceOwnedPath(pathname)
 	)
 }
 
@@ -515,6 +521,224 @@ function isMalformedOAuthClientException(error: unknown, pathname: string) {
 		pathname === oauthPaths.token &&
 		message.includes("Cannot read properties of undefined (reading 'some')")
 	)
+}
+
+/**
+ * Catchable throws on `/mcp` must stay on the connection as JSON-RPC so MCP
+ * clients treat the call as a failed request instead of an OAuth token error
+ * (or a Cloudflare 1101 if the error is rethrown). Real OAuth routes keep the
+ * RFC 6749 error object. This does not cover isolate kills.
+ *
+ * Request IDs are peeked from a clone before `oauthProvider.fetch` so the error
+ * can correlate with the pending call. Peeking is capped so large execute
+ * bodies are not doubled in memory (memory-limit faults are out of scope).
+ * When a clone was created, the catch path discards the original body so an
+ * unread tee cannot terminate the isolate.
+ */
+const mcpJsonRpcIdPeekLimitBytes = 64_000
+const mcpJsonRpcIdPeekDeadlineMs = 250
+
+type McpJsonRpcPeek =
+	| { kind: 'unknown' }
+	| { kind: 'notifications' }
+	| { kind: 'requests'; ids: Array<string | number>; batch: boolean }
+
+type McpJsonRpcPeekResult = {
+	peek: McpJsonRpcPeek
+	/** True when `request.clone()` ran (a tee exists that may need draining). */
+	cloned: boolean
+}
+
+function isJsonRpcId(value: unknown): value is string | number {
+	return typeof value === 'string' || typeof value === 'number'
+}
+
+function isValidJsonRpcMessage(message: Record<string, unknown>) {
+	if (message['jsonrpc'] !== '2.0') return false
+	if (typeof message['method'] !== 'string') return false
+	if ('id' in message && !isJsonRpcId(message['id'])) return false
+	return true
+}
+
+/**
+ * Read at most `maxBytes` from a request body within `deadlineMs`. Returns
+ * `null` when the body exceeds the cap, the deadline expires, or the stream
+ * cannot be read — callers then skip JSON-RPC id peeking.
+ */
+async function readRequestTextUpTo(
+	request: {
+		body: ReadableStream<Uint8Array> | null
+		text(): Promise<string>
+	},
+	maxBytes: number,
+	deadlineMs: number,
+): Promise<string | null> {
+	const body = request.body
+	if (!body) {
+		const text = await Promise.race([
+			request.text(),
+			new Promise<null>((resolve) => {
+				setTimeout(() => resolve(null), deadlineMs)
+			}),
+		])
+		if (text === null) return null
+		return text.length > maxBytes ? null : text
+	}
+	const reader = body.getReader()
+	const chunks: Array<Uint8Array> = []
+	let total = 0
+	let timedOut = false
+	const timeoutId = setTimeout(() => {
+		timedOut = true
+		void reader.cancel()
+	}, deadlineMs)
+	try {
+		for (;;) {
+			const { done, value } = await reader.read()
+			if (timedOut) return null
+			if (done) break
+			if (!value) continue
+			total += value.byteLength
+			if (total > maxBytes) {
+				// Do not await cancel: tee-branch cancellation can stay pending
+				// until the sibling branch is consumed, which would stall
+				// oauthProvider.fetch on the original request.
+				void reader.cancel()
+				return null
+			}
+			chunks.push(value)
+		}
+	} catch {
+		if (timedOut) return null
+		throw new Error('MCP JSON-RPC id peek body read failed')
+	} finally {
+		clearTimeout(timeoutId)
+		try {
+			reader.releaseLock()
+		} catch {
+			// Already canceled/released after deadline or over-limit cancel.
+		}
+	}
+	const merged = new Uint8Array(total)
+	let offset = 0
+	for (const chunk of chunks) {
+		merged.set(chunk, offset)
+		offset += chunk.byteLength
+	}
+	return new TextDecoder().decode(merged)
+}
+
+function classifyParsedMcpJsonRpcBody(parsed: unknown): McpJsonRpcPeek {
+	if (Array.isArray(parsed)) {
+		if (parsed.length === 0) return { kind: 'unknown' }
+		const messages = parsed.filter(isRecord)
+		if (messages.length !== parsed.length) return { kind: 'unknown' }
+		if (!messages.every(isValidJsonRpcMessage)) return { kind: 'unknown' }
+		const ids = messages
+			.filter((message) => 'id' in message)
+			.map((message) => message['id'] as string | number)
+		if (ids.length === 0) return { kind: 'notifications' }
+		return { kind: 'requests', ids, batch: true }
+	}
+	if (!isRecord(parsed) || !isValidJsonRpcMessage(parsed)) {
+		return { kind: 'unknown' }
+	}
+	if (!('id' in parsed)) return { kind: 'notifications' }
+	return {
+		kind: 'requests',
+		ids: [parsed['id'] as string | number],
+		batch: false,
+	}
+}
+
+async function peekMcpJsonRpcRequestIds(
+	request: Request,
+): Promise<McpJsonRpcPeekResult> {
+	const contentLengthHeader = request.headers.get('Content-Length')
+	if (contentLengthHeader !== null) {
+		const contentLength = Number(contentLengthHeader)
+		if (
+			!Number.isFinite(contentLength) ||
+			contentLength <= 0 ||
+			contentLength > mcpJsonRpcIdPeekLimitBytes
+		) {
+			return { peek: { kind: 'unknown' }, cloned: false }
+		}
+	}
+	try {
+		const text = await readRequestTextUpTo(
+			request.clone(),
+			mcpJsonRpcIdPeekLimitBytes,
+			mcpJsonRpcIdPeekDeadlineMs,
+		)
+		if (text === null || text === '') {
+			return { peek: { kind: 'unknown' }, cloned: true }
+		}
+		return {
+			peek: classifyParsedMcpJsonRpcBody(JSON.parse(text)),
+			cloned: true,
+		}
+	} catch {
+		return { peek: { kind: 'unknown' }, cloned: true }
+	}
+}
+
+function createMcpJsonRpcInternalError(id: string | number | null) {
+	return {
+		jsonrpc: '2.0' as const,
+		id,
+		error: {
+			code: -32603,
+			message: 'Internal error',
+		},
+	}
+}
+
+function createMcpProviderExceptionResponse(
+	request: Request,
+	peek: McpJsonRpcPeek,
+) {
+	const headers = {
+		'Cache-Control': 'no-store',
+		'Content-Type': 'application/json',
+	}
+	switch (peek.kind) {
+		case 'unknown':
+			return withMcpCors(
+				request,
+				new Response(JSON.stringify(createMcpJsonRpcInternalError(null)), {
+					status: 500,
+					headers,
+				}),
+			)
+		case 'notifications':
+			// Notifications have a method but no id — JSON-RPC forbids a response body.
+			return withMcpCors(
+				request,
+				new Response(null, {
+					status: 500,
+					headers: { 'Cache-Control': 'no-store' },
+				}),
+			)
+		case 'requests': {
+			const body = peek.batch
+				? peek.ids.map((id) => createMcpJsonRpcInternalError(id))
+				: createMcpJsonRpcInternalError(peek.ids[0]!)
+			return withMcpCors(
+				request,
+				new Response(JSON.stringify(body), {
+					status: 500,
+					headers,
+				}),
+			)
+		}
+		default: {
+			const exhaustive: never = peek
+			throw new Error(
+				`unexpected MCP JSON-RPC peek kind: ${JSON.stringify(exhaustive)}`,
+			)
+		}
+	}
 }
 
 function createOAuthProviderExceptionResponse(
@@ -547,6 +771,18 @@ function createOAuthProviderExceptionResponse(
 		}),
 		{ status: pathname === oauthPaths.register ? 400 : 500, headers },
 	)
+}
+
+function createProviderOwnedPathExceptionResponse(
+	error: unknown,
+	pathname: string,
+	request: Request,
+	mcpPeek: McpJsonRpcPeek,
+) {
+	if (isMcpResourceOwnedPath(pathname)) {
+		return createMcpProviderExceptionResponse(request, mcpPeek)
+	}
+	return createOAuthProviderExceptionResponse(error, pathname)
 }
 
 const workerHandler = {
@@ -755,6 +991,8 @@ async function handleOriginAppFetch(
 		}
 	}
 
+	let mcpPeek: McpJsonRpcPeek = { kind: 'unknown' }
+	let mcpPeekCloned = false
 	try {
 		if (url.pathname === oauthPaths.token && request.method === 'POST') {
 			const { response, grantType } = await handleMcpOAuthTokenRequest({
@@ -767,11 +1005,28 @@ async function handleOriginAppFetch(
 				grantType,
 			})
 		}
+		if (isMcpResourceOwnedPath(url.pathname) && request.method === 'POST') {
+			const peeked = await peekMcpJsonRpcRequestIds(request)
+			mcpPeek = peeked.peek
+			mcpPeekCloned = peeked.cloned
+		}
 		return await oauthProvider.fetch(request, env, ctx)
 	} catch (error) {
 		if (!isOAuthProviderOwnedPath(url.pathname)) throw error
 		Sentry.captureException(error)
-		return createOAuthProviderExceptionResponse(error, url.pathname)
+		if (mcpPeekCloned) {
+			// Only discard when a clone tee exists. Skipping avoids buffering a
+			// large body that was never cloned (Content-Length over the peek
+			// limit). When cloned, drain the original so workerd does not kill
+			// the isolate for an unread tee branch.
+			await discardUnreadRequestBody(request)
+		}
+		return createProviderOwnedPathExceptionResponse(
+			error,
+			url.pathname,
+			request,
+			mcpPeek,
+		)
 	}
 }
 
