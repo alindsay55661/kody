@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 import {
 	copyFile,
 	link,
@@ -23,9 +24,9 @@ import { isExecutedDirectly } from './node-runtime.ts'
 /**
  * Pre-bundles `@cloudflare/worker-bundler` (and its `/typescript` entry),
  * `@cloudflare/workers-oauth-provider`, the platform-supplied `remix`
- * package for package apps, and local-execute runtime support (inlined CAF
- * rewrite + CapabilityProxy shim source builders) into standalone ES modules
- * under `packages/worker/.generated/`.
+ * package for package apps, local-execute runtime support (inlined CAF
+ * rewrite + CapabilityProxy shim source builders), and isomorphic-git into
+ * standalone ES modules under `packages/worker/.generated/`.
  *
  * Why: wrangler inlines every dynamic `import()` into the single main worker
  * module, so the ~3.6 MB runtime bundler/TypeScript compiler was parsed and
@@ -40,7 +41,10 @@ import { isExecutedDirectly } from './node-runtime.ts'
  * (scheduled purge lane, the `MCP` Durable Object on kody-platform), and the
  * platform/runtime startup entries must not carry it. Local-execute package
  * graph (#2830 rewrite / shim templates) uses the same deferral so platform
- * startup bytes stay under budget (kody#2831).
+ * startup bytes stay under budget (kody#2831). isomorphic-git is already lazy
+ * for CPU via `#worker/isomorphic-git-load.ts`; the additional module
+ * keeps its ~160 KB (+ pako) out of the Wrangler main byte graph after the
+ * Zod 4.6.5 startup growth (kody#2839 / kody#2856).
  *
  * Wrangler discovers additional ES modules by walking the entry directory
  * (`packages/worker/src`) and file-watches every discovered module. Overlay-FS
@@ -101,12 +105,18 @@ const localExecuteRuntimeSupportEntry = path.join(
 	repoRoot,
 	'packages/worker/src/package-runtime/local-execute-runtime-support.ts',
 )
+export const isomorphicGitModuleName = 'isomorphic-git.mjs'
+const isomorphicGitModuleEntry = path.join(
+	repoRoot,
+	'packages/worker/src/repo/isomorphic-git-module.ts',
+)
 const generatedArtifactNames = [
 	'worker-bundler.mjs',
 	'worker-bundler-typescript.mjs',
 	'oauth-provider.mjs',
 	packageAppRemixModuleName,
 	localExecuteRuntimeSupportModuleName,
+	isomorphicGitModuleName,
 	'esbuild.wasm',
 ] as const
 const leftoverWranglerVisibleNames = [
@@ -277,6 +287,18 @@ async function buildStampContent(
 		path.join(repoRoot, 'packages/worker/src/module-source.ts'),
 		'utf8',
 	)
+	const isomorphicGitModuleSource = await readFile(
+		isomorphicGitModuleEntry,
+		'utf8',
+	)
+	const isomorphicGitPackageJson = await readFile(
+		path.join(repoRoot, 'node_modules', 'isomorphic-git', 'package.json'),
+		'utf8',
+	)
+	const shellPackageJson = await readFile(
+		path.join(repoRoot, 'node_modules', '@cloudflare', 'shell', 'package.json'),
+		'utf8',
+	)
 	const esbuildVersion = (
 		JSON.parse(
 			await readFile(
@@ -298,6 +320,9 @@ async function buildStampContent(
 		.update(localExecuteRuntimeSupportSource)
 		.update(localExecuteRewriteSource)
 		.update(localExecuteModuleSource)
+		.update(isomorphicGitModuleSource)
+		.update(isomorphicGitPackageJson)
+		.update(shellPackageJson)
 		.update(
 			await readFile(
 				path.join(
@@ -529,6 +554,7 @@ export async function ensureWorkerBundlerModules() {
 		logLevel: 'silent',
 	})
 	await buildLocalExecuteRuntimeSupportModule()
+	await buildIsomorphicGitModule()
 	await copyFile(
 		path.join(bundlerPackageDir, 'dist/esbuild.wasm'),
 		path.join(workerBundlerGeneratedDir, 'esbuild.wasm'),
@@ -555,6 +581,47 @@ async function buildLocalExecuteRuntimeSupportModule() {
 			localExecuteRuntimeSupportModuleName,
 		),
 		plugins: [externalsPlugin, kodyPackageImportsPlugin],
+		logLevel: 'silent',
+	})
+}
+
+async function buildIsomorphicGitModule() {
+	// Do not reuse `externalsPlugin` here: marking `buffer` external leaves a
+	// `require("node:buffer")` in the additional module, and workerd rejects
+	// dynamic Node builtin requires in ESM additional modules (package-create /
+	// RepoSession git paths fail with "Dynamic require of node:buffer is not
+	// supported"). Polyfill Buffer into the bundle; keep only `node:crypto` for
+	// `@cloudflare/shell` workspace hashing under `nodejs_compat`.
+	const require = createRequire(import.meta.url)
+	const isomorphicGitExternalsPlugin: Plugin = {
+		name: 'isomorphic-git-externals',
+		setup(pluginBuild) {
+			pluginBuild.onResolve({ filter: /^cloudflare:/ }, (args) => ({
+				path: args.path,
+				external: true,
+			}))
+			pluginBuild.onResolve({ filter: /^node:crypto$/ }, (args) => ({
+				path: args.path,
+				external: true,
+			}))
+			pluginBuild.onResolve({ filter: /^crypto$/ }, () => ({
+				path: 'node:crypto',
+				external: true,
+			}))
+			pluginBuild.onResolve({ filter: /^(node:)?buffer$/ }, () => ({
+				path: require.resolve('buffer/'),
+			}))
+		},
+	}
+	await build({
+		entryPoints: [isomorphicGitModuleEntry],
+		bundle: true,
+		format: 'esm',
+		platform: 'browser',
+		target: 'es2022',
+		minify: true,
+		outfile: path.join(workerBundlerGeneratedDir, isomorphicGitModuleName),
+		plugins: [isomorphicGitExternalsPlugin],
 		logLevel: 'silent',
 	})
 }

@@ -12,7 +12,6 @@ import {
 	resolveUnifiedDiffFileNames,
 	stripUnifiedDiffPath,
 } from './unified-diff-paths.ts'
-import { createGit } from '@cloudflare/shell/git'
 import {
 	deleteRepoSession,
 	getRepoSessionById,
@@ -183,6 +182,7 @@ type CachedRepoSessionState = {
 }
 
 type RawGitPushInput = Parameters<IsomorphicGit['git']['push']>[0]
+type CreateGit = typeof import('@cloudflare/shell/git').createGit
 
 function nowIso() {
 	return new Date().toISOString()
@@ -317,7 +317,15 @@ class RepoSessionBase extends DurableObject<Env> {
 
 	readonly state = createWorkspaceStateBackend(this.workspace)
 
-	readonly git = createGit(this.fileSystem, repoSessionWorkspacePrefix)
+	private gitApi: ReturnType<CreateGit> | null = null
+
+	private async ensureGit() {
+		if (!this.gitApi) {
+			const { createGit: createShellGit } = await loadIsomorphicGit()
+			this.gitApi = createShellGit(this.fileSystem, repoSessionWorkspacePrefix)
+		}
+		return this.gitApi
+	}
 
 	private initializedSessionId: string | null = null
 
@@ -344,7 +352,9 @@ class RepoSessionBase extends DurableObject<Env> {
 				await this.workspace.mkdir(repoSessionWorkspacePrefix, {
 					recursive: true,
 				})
-				await this.git.clone({
+				await (
+					await this.ensureGit()
+				).clone({
 					dir: repoSessionWorkspacePrefix,
 					...(input.branch
 						? {
@@ -534,7 +544,9 @@ class RepoSessionBase extends DurableObject<Env> {
 	}
 
 	private async ensureRemote(input: { name: string; url: string }) {
-		const existing = await this.git.remote({
+		const existing = await (
+			await this.ensureGit()
+		).remote({
 			dir: repoSessionWorkspacePrefix,
 			list: true,
 		})
@@ -544,12 +556,16 @@ class RepoSessionBase extends DurableObject<Env> {
 			return
 		}
 		if (current) {
-			await this.git.remote({
+			await (
+				await this.ensureGit()
+			).remote({
 				dir: repoSessionWorkspacePrefix,
 				remove: input.name,
 			})
 		}
-		await this.git.remote({
+		await (
+			await this.ensureGit()
+		).remote({
 			dir: repoSessionWorkspacePrefix,
 			add: {
 				name: input.name,
@@ -581,7 +597,9 @@ class RepoSessionBase extends DurableObject<Env> {
 
 	private async hasExpectedOriginRemote(expectedUrl: string) {
 		try {
-			const remotes = await this.git.remote({
+			const remotes = await (
+				await this.ensureGit()
+			).remote({
 				dir: repoSessionWorkspacePrefix,
 				list: true,
 			})
@@ -621,7 +639,9 @@ class RepoSessionBase extends DurableObject<Env> {
 	}
 
 	private async getHeadCommit() {
-		const log = await this.git.log({
+		const log = await (
+			await this.ensureGit()
+		).log({
 			dir: repoSessionWorkspacePrefix,
 			depth: 1,
 		})
@@ -633,7 +653,9 @@ class RepoSessionBase extends DurableObject<Env> {
 		options?: { replaceHistory?: boolean },
 	) {
 		const replaceHistory = options?.replaceHistory === true
-		const statusEntries = await this.git.status({
+		const statusEntries = await (
+			await this.ensureGit()
+		).status({
 			dir: repoSessionWorkspacePrefix,
 		})
 		const hasChanges = statusEntries.some(
@@ -642,7 +664,9 @@ class RepoSessionBase extends DurableObject<Env> {
 		if (!hasChanges && !replaceHistory) {
 			return this.getHeadCommit()
 		}
-		await this.git.add({
+		await (
+			await this.ensureGit()
+		).add({
 			dir: repoSessionWorkspacePrefix,
 			filepath: '.',
 		})
@@ -656,7 +680,9 @@ class RepoSessionBase extends DurableObject<Env> {
 				parent: [],
 			})
 		}
-		const commit = await this.git.commit({
+		const commit = await (
+			await this.ensureGit()
+		).commit({
 			dir: repoSessionWorkspacePrefix,
 			message,
 			author: sessionCommitAuthor,
@@ -1477,16 +1503,22 @@ class RepoSessionBase extends DurableObject<Env> {
 				branch: sourceBranch,
 				resetBeforeFirstAttempt: true,
 			})
-			await this.git.checkout({
+			await (
+				await this.ensureGit()
+			).checkout({
 				dir: repoSessionWorkspacePrefix,
 				ref: baseCommit,
 				force: true,
 			})
-			await this.git.checkout({
+			await (
+				await this.ensureGit()
+			).checkout({
 				dir: repoSessionWorkspacePrefix,
 				branch: sessionBranch,
 			})
-			await this.git.push({
+			await (
+				await this.ensureGit()
+			).push({
 				dir: repoSessionWorkspacePrefix,
 				remote: 'origin',
 				ref: sessionBranch,
@@ -1676,7 +1708,9 @@ class RepoSessionBase extends DurableObject<Env> {
 				await this.workspace.mkdir(repoSessionWorkspacePrefix, {
 					recursive: true,
 				})
-				await this.git.init({
+				await (
+					await this.ensureGit()
+				).init({
 					dir: repoSessionWorkspacePrefix,
 					defaultBranch: targetBranch,
 				})
@@ -1720,8 +1754,8 @@ class RepoSessionBase extends DurableObject<Env> {
 				`Source "${source.id}" first-publish from dest HEAD produced an empty workspace snapshot.`,
 			)
 		}
-		await pushServerTiming(serverTiming, 'bootstrap-git-push', () =>
-			this.git.push({
+		await pushServerTiming(serverTiming, 'bootstrap-git-push', async () =>
+			(await this.ensureGit()).push({
 				dir: repoSessionWorkspacePrefix,
 				remote: 'source',
 				ref: targetBranch,
@@ -2179,12 +2213,12 @@ class RepoSessionBase extends DurableObject<Env> {
 
 	async sessionStatus(input: { sessionId: string; userId: string }) {
 		await this.getSessionState(input.sessionId, input.userId)
-		return this.git.status({ dir: repoSessionWorkspacePrefix })
+		return (await this.ensureGit()).status({ dir: repoSessionWorkspacePrefix })
 	}
 
 	async sessionDiff(input: { sessionId: string; userId: string }) {
 		await this.getSessionState(input.sessionId, input.userId)
-		return this.git.diff({ dir: repoSessionWorkspacePrefix })
+		return (await this.ensureGit()).diff({ dir: repoSessionWorkspacePrefix })
 	}
 
 	async sessionLog(input: {
@@ -2193,7 +2227,7 @@ class RepoSessionBase extends DurableObject<Env> {
 		depth?: number
 	}) {
 		await this.getSessionState(input.sessionId, input.userId)
-		return this.git.log({
+		return (await this.ensureGit()).log({
 			dir: repoSessionWorkspacePrefix,
 			depth: input.depth,
 		})
@@ -2211,11 +2245,15 @@ class RepoSessionBase extends DurableObject<Env> {
 		if (!input.message.trim()) {
 			throw new Error('Commit message cannot be empty.')
 		}
-		await this.git.add({
+		await (
+			await this.ensureGit()
+		).add({
 			dir: repoSessionWorkspacePrefix,
 			filepath: '.',
 		})
-		const commit = await this.git.commit({
+		const commit = await (
+			await this.ensureGit()
+		).commit({
 			dir: repoSessionWorkspacePrefix,
 			message: input.message,
 			author: sessionCommitAuthor,
@@ -2786,7 +2824,9 @@ class RepoSessionBase extends DurableObject<Env> {
 			input.userId,
 		)
 		const sessionBranch = sessionRow.session_branch
-		const pullResult = await this.git.pull({
+		const pullResult = await (
+			await this.ensureGit()
+		).pull({
 			dir: repoSessionWorkspacePrefix,
 			remote: 'origin',
 			ref: sessionRow.source_branch,
@@ -2796,7 +2836,9 @@ class RepoSessionBase extends DurableObject<Env> {
 		const headCommit = await this.getHeadCommit()
 		// Session branches are ephemeral workspace state; pull/merge can rewrite
 		// history, so force-push the session ref (never the source branch).
-		await this.git.push({
+		await (
+			await this.ensureGit()
+		).push({
 			dir: repoSessionWorkspacePrefix,
 			remote: 'origin',
 			ref: sessionBranch,
@@ -2869,7 +2911,9 @@ class RepoSessionBase extends DurableObject<Env> {
 				input.commitMessage?.trim() ||
 					`Publish repo session ${input.sessionRow.id}`,
 			)) ?? (await this.getHeadCommit())
-		await this.git.push({
+		await (
+			await this.ensureGit()
+		).push({
 			dir: repoSessionWorkspacePrefix,
 			remote: 'origin',
 			ref: sessionBranch,
@@ -3037,7 +3081,9 @@ class RepoSessionBase extends DurableObject<Env> {
 			source.entity_kind,
 			input.expectedPackageScope,
 		)
-		await this.git.push({
+		await (
+			await this.ensureGit()
+		).push({
 			dir: repoSessionWorkspacePrefix,
 			remote: 'origin',
 			ref: sessionBranch,

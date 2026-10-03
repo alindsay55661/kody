@@ -37,6 +37,7 @@ test('ensureWorkerBundlerModules writes bundler artifacts outside the src watch 
 		'oauth-provider.mjs',
 		'package-app-remix.mjs',
 		'local-execute-runtime-support.mjs',
+		'isomorphic-git.mjs',
 		'esbuild.wasm',
 		'worker-bundler.stamp.json',
 	] as const) {
@@ -50,6 +51,7 @@ test('ensureWorkerBundlerModules writes bundler artifacts outside the src watch 
 		'oauth-provider.mjs',
 		'package-app-remix.mjs',
 		'local-execute-runtime-support.mjs',
+		'isomorphic-git.mjs',
 		'esbuild.wasm',
 	] as const) {
 		expect(await pathExists(path.join(workerBundlerWranglerDir, name))).toBe(
@@ -149,6 +151,17 @@ test('ensureWorkerBundlerModules vendors every allowlisted remix subpath as one 
 		'node:async_hooks',
 		'node:zlib',
 	])
+})
+
+test('isomorphic-git additional module polyfills Buffer instead of requiring node:buffer', async () => {
+	await ensureWorkerBundlerModules()
+	const source = await readFile(
+		path.join(workerBundlerGeneratedDir, 'isomorphic-git.mjs'),
+		'utf8',
+	)
+	expect(source).not.toContain('node:buffer')
+	expect(source).toContain('node:crypto')
+	expect(source).not.toMatch(/require\(["']node:buffer["']\)/)
 })
 
 test('ensureWorkerBundlerModules removes leftover src/generated bundler artifacts', async () => {
