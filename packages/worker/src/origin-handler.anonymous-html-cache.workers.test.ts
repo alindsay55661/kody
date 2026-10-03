@@ -94,6 +94,16 @@ test('anonymous marketing HTML is stored in caches.default and replayed as HIT',
 			status: response.status,
 			cacheControl: response.headers.get('Cache-Control'),
 		})
+		if (
+			typeof headers === 'object' &&
+			'Cookie' in headers &&
+			String(headers.Cookie).includes('kody_site_banner_dismiss=')
+		) {
+			expect(response.headers.get('Set-Cookie') ?? '').toContain(
+				'kody_site_banner_dismiss=',
+			)
+			expect(response.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0')
+		}
 		await response.body?.cancel()
 	}
 	expect(outcomes).toMatchObject(
