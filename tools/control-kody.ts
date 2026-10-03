@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { checkInstalledLockfile } from './check-installed-lockfile.ts'
 import {
 	createDefaultEnsureDevDeps,
 	ensureDev,
@@ -77,7 +78,7 @@ const usageLines = [
 	'Drive and verify the Kody app without throwaway scripts.',
 	'',
 	'Commands:',
-	'  doctor          Check Node, Playwright browser revision, hooks, /health, and local APP_DB',
+	'  doctor          Check Node, Playwright browser revision, hooks, installed deps, /health, and local APP_DB',
 	'  dev             Start or reuse the local origin (npm run dev:ensure)',
 	'  login           POST /auth and write a session cookie',
 	'  request         Authenticated HTTP as the current session',
@@ -457,6 +458,9 @@ export type DoctorDeps = {
 	homeDir: string
 	hooksPath: string | null
 	inspectPlaywright: (homeDir: string) => PlaywrightBrowserCheck
+	inspectInstalledLockfile?: () =>
+		| { ok: boolean; detail: string }
+		| Promise<{ ok: boolean; detail: string }>
 	probeHealth: (origin: string) => Promise<boolean>
 	ports: ReadonlyArray<number>
 	origin: string | null
@@ -490,6 +494,24 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
 		detail: hooksOk
 			? `core.hooksPath=${deps.hooksPath}`
 			: 'git core.hooksPath is empty. Run npm run hooks:ensure.',
+	})
+
+	const inspectInstalledLockfile =
+		deps.inspectInstalledLockfile ?? checkInstalledLockfile
+	let installedLockfile: { ok: boolean; detail: string }
+	try {
+		installedLockfile = await inspectInstalledLockfile()
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error)
+		installedLockfile = {
+			ok: false,
+			detail: `Could not inspect package-lock.json: ${detail}. Check that the file is readable and valid JSON.`,
+		}
+	}
+	checks.push({
+		name: 'deps',
+		ok: installedLockfile.ok,
+		detail: installedLockfile.detail,
 	})
 
 	const origin =
@@ -879,6 +901,7 @@ export function defaultDoctorDeps(origin: string | null = null): DoctorDeps {
 				homeDir,
 				browsersJsonPath: defaultPlaywrightBrowsersJsonPath(repoRootFromHere()),
 			}),
+		inspectInstalledLockfile: () => checkInstalledLockfile(),
 		probeHealth: (value) => isWorkerHealthOk(value),
 		ports: workerPortRange(),
 		origin,

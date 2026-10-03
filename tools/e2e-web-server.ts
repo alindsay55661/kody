@@ -8,6 +8,12 @@ import {
 } from './e2e-cloudflare-mock-state.ts'
 import { isExecutedDirectly, resolveNpmCommand } from './node-runtime.ts'
 import { spawnChildProcess, stopChildProcessTree } from './dev-process-utils.ts'
+import { workerOriginForPort } from './dev-server.ts'
+import {
+	createDefaultEnsureDevDeps,
+	hasKodyDevListeners,
+	type ProcessIdentity,
+} from './ensure-dev.ts'
 
 /** Same default as `playwright.config.ts` when `--port` is omitted. */
 export const defaultE2eWebServerPort = '3847'
@@ -28,6 +34,29 @@ export function resolveE2eWebServerHealthUrl(
  * After Playwright starts specs, a crash must kill this wrapper so the
  * suite-level dead-server retry can start a fresh run.
  */
+export function formatUnhealthyOriginDevServerHint() {
+	return 'An existing kody `dev:ensure` server is listening but /health is failing. Stop that Vite/workerd process before `npm run test:e2e:run`; a crash-looping origin on 3742 collides with the e2e web server (inspector port / fetchWorkerExportTypes).'
+}
+
+export async function findUnhealthyOriginDevServerMessage(input: {
+	ports: ReadonlyArray<number>
+	probeHealth: (origin: string) => Promise<boolean>
+	listListenerPids: (port: number) => Array<number>
+	readProcess: (pid: number) => ProcessIdentity | null
+	protectedPids: ReadonlySet<number>
+}) {
+	for (const port of input.ports) {
+		const hasListener = hasKodyDevListeners({
+			...input,
+			ports: [port],
+		})
+		if (!hasListener) continue
+		if (await input.probeHealth(workerOriginForPort(port))) continue
+		return formatUnhealthyOriginDevServerHint()
+	}
+	return null
+}
+
 export function shouldRetryE2eWebServerFirstStart(input: {
 	allowRetry: boolean
 	shuttingDown: boolean
@@ -52,6 +81,13 @@ function runSetup(command: string, args: Array<string>) {
 }
 
 async function startE2eWebServer() {
+	const staleOrigin = await findUnhealthyOriginDevServerMessage(
+		createDefaultEnsureDevDeps(),
+	)
+	if (staleOrigin) {
+		throw new Error(staleOrigin)
+	}
+
 	runSetup(process.execPath, ['tools/prepare-e2e-env.ts'])
 	runSetup(resolveNpmCommand(), ['run', 'migrate:e2e'])
 

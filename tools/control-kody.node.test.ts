@@ -356,12 +356,17 @@ test('control-kody parses commands, maps every required route, and drives a seed
 	)
 })
 
-test('runDoctor reports node, playwright, hooks, health, and local-d1 checks', async () => {
+test('runDoctor reports node, playwright, hooks, deps, health, and local-d1 checks', async () => {
+	const depsOk = {
+		ok: true,
+		detail: 'installed dependencies match package-lock.json',
+	}
 	const doctor = await runDoctor({
 		nodeVersion: 'v26.1.2',
 		homeDir: tmpdir(),
 		hooksPath: '.husky',
 		inspectPlaywright: playwrightOk,
+		inspectInstalledLockfile: () => depsOk,
 		probeHealth: async () => true,
 		ports: [3742],
 		origin: 'http://localhost:3742',
@@ -378,6 +383,7 @@ test('runDoctor reports node, playwright, hooks, health, and local-d1 checks', a
 		'node',
 		'playwright',
 		'hooks',
+		'deps',
 		'health',
 		'local-d1',
 	])
@@ -393,6 +399,7 @@ test('runDoctor reports node, playwright, hooks, health, and local-d1 checks', a
 		homeDir: tmpdir(),
 		hooksPath: null,
 		inspectPlaywright: () => ({ ok: false, detail: missingPlaywright }),
+		inspectInstalledLockfile: () => depsOk,
 		probeHealth: async () => false,
 		ports: [3742],
 		origin: null,
@@ -413,6 +420,7 @@ test('runDoctor reports node, playwright, hooks, health, and local-d1 checks', a
 		homeDir: tmpdir(),
 		hooksPath: '.husky',
 		inspectPlaywright: playwrightOk,
+		inspectInstalledLockfile: () => depsOk,
 		probeHealth: async () => true,
 		ports: [3742],
 		origin: 'http://localhost:3742',
@@ -427,6 +435,52 @@ test('runDoctor reports node, playwright, hooks, health, and local-d1 checks', a
 	expect(failedLogin.ok).toBe(false)
 	expect(
 		failedLogin.checks.some((check) => check.name === 'local-d1' && !check.ok),
+	).toBe(true)
+
+	const staleInstall = await runDoctor({
+		nodeVersion: 'v26.1.2',
+		homeDir: tmpdir(),
+		hooksPath: '.husky',
+		inspectPlaywright: playwrightOk,
+		inspectInstalledLockfile: () => ({
+			ok: false,
+			detail:
+				'Installed dependencies do not match package-lock.json. Run `npm ci`.',
+		}),
+		probeHealth: async () => true,
+		ports: [3742],
+		origin: null,
+		persistRoot: tmpdir(),
+	})
+	expect(staleInstall.ok).toBe(false)
+	expect(staleInstall.checks.find((check) => check.name === 'deps')?.ok).toBe(
+		false,
+	)
+
+	const unreadableLockfile = await runDoctor({
+		nodeVersion: 'v26.1.2',
+		homeDir: tmpdir(),
+		hooksPath: '.husky',
+		inspectPlaywright: playwrightOk,
+		inspectInstalledLockfile: async () => {
+			throw new Error('Unexpected end of JSON input')
+		},
+		probeHealth: async () => true,
+		ports: [3742],
+		origin: null,
+		persistRoot: tmpdir(),
+	})
+	expect(unreadableLockfile.ok).toBe(false)
+	expect(
+		unreadableLockfile.checks.find((check) => check.name === 'deps'),
+	).toEqual({
+		name: 'deps',
+		ok: false,
+		detail:
+			'Could not inspect package-lock.json: Unexpected end of JSON input. Check that the file is readable and valid JSON.',
+	})
+	expect(
+		unreadableLockfile.checks.some((check) => check.name === 'health'),
 	).toBe(true)
 })
 
