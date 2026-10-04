@@ -319,6 +319,10 @@
 		{
 			"filename": "0079-connection-profiles.sql",
 			"sha256": "28ca4ece3c90b7e39995712784642dc31ba3c550c078f724ae999d352cb23478"
+		},
+		{
+			"filename": "0080-signup-welcome-credits-pending.sql",
+			"sha256": "b52fd72db87e6083dd27114bea2bd16386affcefb1958a3dc6cf445e3e661515"
 		}
 	]
 }

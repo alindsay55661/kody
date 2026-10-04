@@ -58,7 +58,10 @@ import {
 } from '#universal/referral-cookie.ts'
 import { touchLastActiveAt } from '#worker/identity/activation-stamps.ts'
 import { scheduleUserCreatedEvent } from '#worker/identity/schedule-user-lifecycle-event.ts'
-import { maybeGrantSignupWelcomeCredits } from '#worker/billing/signup-welcome-credits.ts'
+import {
+	maybeGrantSignupWelcomeCredits,
+	reconcileSignupWelcomeCreditsIfPending,
+} from '#worker/billing/signup-welcome-credits.ts'
 import { attributeReferralAtSignup } from '#worker/entitlements/referral-program.ts'
 
 const authModes = ['login', 'signup'] as const
@@ -331,6 +334,10 @@ export function createAuthHandler(env: Env) {
 							stable_user_id: stableUserId,
 							password_hash: passwordHash,
 							plan: resolvePlanWrite(null),
+							// Set with the insert so a later D1 blip during the
+							// grant cannot erase the retry signal (default 0
+							// still grandfathering pre-ship rows).
+							signup_welcome_credits_pending: 1,
 							...firstTouchAttributionCreateFields(signupAttribution),
 							last_active_at: createdAt,
 						},
@@ -671,16 +678,21 @@ export function createAuthHandler(env: Env) {
 				)
 			}
 
+			const stableUserId = resolveUserStableId(userRecord)
 			const cookie = await createAuthCookie(
 				{
-					stableUserId: resolveUserStableId(userRecord),
+					stableUserId,
 					email: normalizedEmail,
 					rememberMe,
 				},
 				isSecureRequest(request),
 			)
 			await touchLastActiveAt(env.APP_DB, {
-				stableUserId: resolveUserStableId(userRecord),
+				stableUserId,
+			})
+			await reconcileSignupWelcomeCreditsIfPending({
+				db: env.APP_DB,
+				userId: stableUserId,
 			})
 			void logAuditEvent({
 				db: auditDatabaseFromEnv(env),
