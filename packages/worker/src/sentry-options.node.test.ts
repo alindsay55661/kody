@@ -5,6 +5,7 @@ import {
 	ComputeOverageLimitError,
 	EntitlementLimitError,
 } from './entitlements/errors.ts'
+import { artifactsGitTemporarilyUnavailableMessage } from './open-api/errors.ts'
 import {
 	buildArtifactsOpaqueInternalErrorMessage,
 	buildArtifactsRepoLookupTimeoutMessage,
@@ -318,7 +319,10 @@ test('filterSentryEvent drops expected platform and caller noise and keeps real 
 	}
 
 	// User-code errors drop via the typed originalException (including causes).
-	const userCodeEvent = exceptionEvent({ type: 'UserCodeError', value: 'boom' })
+	const userCodeEvent = exceptionEvent({
+		type: 'UserCodeError',
+		value: 'boom',
+	})
 	expect(
 		filterSentryEvent(userCodeEvent, {
 			originalException: new UserCodeError('boom'),
@@ -402,8 +406,81 @@ test('filterSentryEvent drops expected platform and caller noise and keeps real 
 			{ originalException: new Error(entitlementLimitError.message) },
 		),
 	).not.toBeNull()
-})
 
+	// KODY-8P: Open API remaps exhausted Artifacts git transients to ApiError
+	// (503 internal_error) with the wrapper as cause. Drop via the cause chain
+	// even when the public message is the sanitized retry sentence.
+	const artifactsGitWrapper = new Error(
+		`Artifacts git clone failed for ${artifactsRepo}: HTTP Error: 500 Internal Server Error`,
+		{ cause: new Error('HTTP Error: 500 Internal Server Error') },
+	)
+	const remappedArtifactsApiError = new Error(
+		artifactsGitTemporarilyUnavailableMessage,
+		{ cause: artifactsGitWrapper },
+	)
+	remappedArtifactsApiError.name = 'ApiError'
+	const remappedArtifactsEvent = exceptionEvent({
+		type: 'ApiError',
+		value: remappedArtifactsApiError.message,
+	})
+	expect(
+		filterSentryEvent(remappedArtifactsEvent, {
+			originalException: remappedArtifactsApiError,
+		}),
+	).toBeNull()
+	expect(filterSentryEvent(remappedArtifactsEvent)).toBe(remappedArtifactsEvent)
+
+	// Bare TimeoutError / unrelated wraps must not drop via the remapped path.
+	const bareTimeout = new Error('The operation timed out.')
+	bareTimeout.name = 'TimeoutError'
+	const oauthTimeoutEvent = exceptionEvent({
+		type: 'Error',
+		value: 'Token refresh failed for integration "google".',
+	})
+	expect(
+		filterSentryEvent(oauthTimeoutEvent, {
+			originalException: new Error(
+				'Token refresh failed for integration "google".',
+				{ cause: bareTimeout },
+			),
+		}),
+	).toBe(oauthTimeoutEvent)
+
+	const sourceRecoveryMessage =
+		'packageGetGitRemote stopped by the production package source safety policy. Stop and report this source recovery problem instead of rebuilding or overwriting the package in place.'
+	const sourceRecoveryEvent = exceptionEvent({
+		type: 'Error',
+		value: sourceRecoveryMessage,
+	})
+	expect(
+		filterSentryEvent(sourceRecoveryEvent, {
+			originalException: new Error(sourceRecoveryMessage, {
+				cause: artifactsGitWrapper,
+			}),
+		}),
+	).toBe(sourceRecoveryEvent)
+
+	// After toApiError wraps source-recovery as a generic ApiError, the top
+	// message is no longer the stop-guidance sentence — still keep the event.
+	const remappedRecoveryApiError = new Error(
+		'Internal error. Retry later or report it if it persists.',
+		{
+			cause: new Error(sourceRecoveryMessage, {
+				cause: artifactsGitWrapper,
+			}),
+		},
+	)
+	remappedRecoveryApiError.name = 'ApiError'
+	const remappedRecoveryEvent = exceptionEvent({
+		type: 'ApiError',
+		value: remappedRecoveryApiError.message,
+	})
+	expect(
+		filterSentryEvent(remappedRecoveryEvent, {
+			originalException: remappedRecoveryApiError,
+		}),
+	).toBe(remappedRecoveryEvent)
+})
 test('filterSentryEvent redacts Kody credentials from event messages', () => {
 	const apiToken = `kody_at_${'a'.repeat(20)}_${'B'.repeat(43)}`
 	const bootstrapCode = `kody_bc_${'c'.repeat(16)}_${'D'.repeat(32)}`

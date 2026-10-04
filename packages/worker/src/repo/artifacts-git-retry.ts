@@ -150,6 +150,37 @@ export function isArtifactsGitTimeoutMessage(message: string) {
 	return /Artifacts git request timed out after \d+ms/.test(message)
 }
 
+/**
+ * True when Open API / Sentry should treat this as an exhausted Artifacts git
+ * transient (KODY-8P). Requires an Artifacts-specific marker in the cause
+ * chain — wrapper HTTP phrase, packfile phrase, `ArtifactsGitTimeoutError`,
+ * or the Artifacts timeout message — not a bare `TimeoutError` or a nested
+ * `HTTP Error: NNN` under an unrelated outer failure. Source-recovery stop
+ * guidance anywhere in the cause chain is never remapped (including after
+ * `toApiError` wraps the recovery error as a generic `ApiError`).
+ */
+export function isArtifactsGitTransientRemapError(error: unknown) {
+	const chain = getErrorCauseChain(error)
+	if (chain.length === 0) return false
+	if (
+		chain.some((entry) =>
+			getErrorMessage(entry).includes(
+				'Stop and report this source recovery problem',
+			),
+		)
+	) {
+		return false
+	}
+	return chain.some((entry) => {
+		if (!(entry instanceof Error)) return false
+		if (isArtifactsGitTransientHttpErrorMessage(entry.message)) return true
+		if (isIsomorphicGitPackfileCorruptionMessage(entry.message)) return true
+		if (entry.name === 'ArtifactsGitTimeoutError') return true
+		if (isArtifactsGitTimeoutMessage(entry.message)) return true
+		return false
+	})
+}
+
 function describeArtifactRemote(remote: string) {
 	try {
 		const url = new URL(remote)
