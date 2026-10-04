@@ -22,6 +22,7 @@ import {
 	authorizeSharedPackagePermission,
 	packageShareAccessErrorMessage,
 } from '#worker/package-registry/share-grants.ts'
+import { assertCallerCanAccessResource } from '#worker/connection-profiles/access.ts'
 import { packageDetailSchema } from './shared.ts'
 
 export const getPackageCapability = defineDomainCapability(
@@ -103,6 +104,13 @@ export const getPackageCapability = defineDomainCapability(
 				}
 				throw new McpCallerError('Saved package not found for this user.')
 			}
+			await assertCallerCanAccessResource({
+				env: ctx.env,
+				callerContext: ctx.callerContext,
+				resourceType: 'package',
+				resourceId: saved.id,
+				action: 'read',
+			})
 			const loaded = await loadPackageSourceBySourceId({
 				env: ctx.env,
 				baseUrl: ctx.callerContext.baseUrl,

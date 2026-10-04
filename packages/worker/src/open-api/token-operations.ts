@@ -24,6 +24,15 @@ import {
 	type NativeApiOperationDefinition,
 } from './native-operation-helpers.ts'
 import { type NativeApiOperationId } from './operations.ts'
+import { connectionProfilesFlagKey } from '#universal/feature-flags/registry.ts'
+import { isFeatureEnabled } from '#worker/feature-flags/service.ts'
+import { readCallerConnectionProfileName } from '#worker/connection-profiles/access.ts'
+import { getConnectionProfileByName } from '#worker/connection-profiles/repo.ts'
+import {
+	connectionProfileNameErrorMessage,
+	getConnectionProfileNameValidationError,
+	normalizeConnectionProfileName,
+} from '#universal/connection-profiles/names.ts'
 
 const scopeSchema = z.enum(
 	apiTokenScopes as [ApiTokenScope, ...Array<ApiTokenScope>],
@@ -55,6 +64,12 @@ const tokenViewSchema = z.object({
 	last_used_at: z.string().nullable(),
 	rotated_at: z.string().nullable(),
 	revoked_at: z.string().nullable(),
+	profile_name: z
+		.string()
+		.nullable()
+		.describe(
+			'Named connection profile this token is bound to, or null for unlimited.',
+		),
 })
 
 const tokenSecretViewSchema = tokenViewSchema.extend({
@@ -80,6 +95,14 @@ const tokenCreateInputSchema = z
 			.min(1)
 			.describe(
 				`Scopes to grant. \`<resource>:write\` also grants \`<resource>:read\`. A token can only mint tokens with scopes it holds.\n${scopeListDescription}`,
+			),
+		profile: z
+			.string()
+			.min(1)
+			.max(64)
+			.optional()
+			.describe(
+				'Optional connection profile name. The token’s package access is limited to that profile’s grants. Experimenters only.',
 			),
 		idle_ttl_seconds: z
 			.number()
@@ -145,12 +168,17 @@ async function assertCallerMayRotate(
 	)
 	const outlives =
 		Date.parse(target.max_expires_at) > Date.parse(caller.max_expires_at)
-	if (missing.length === 0 && !outlives) return
+	const callerProfile = caller.profile_name ?? null
+	const targetProfile = target.profile_name ?? null
+	const profileEscalation =
+		callerProfile != null && callerProfile !== targetProfile
+	if (missing.length === 0 && !outlives && !profileEscalation) return
 	throw new ApiError({
 		status: 403,
 		code: 'insufficient_scope',
-		message:
-			missing.length > 0
+		message: profileEscalation
+			? 'This profile-bound API token cannot rotate a token for a different connection profile (or an unlimited token).'
+			: missing.length > 0
 				? `This API token cannot rotate a token with scopes it does not hold: ${missing.join(', ')}.`
 				: 'This API token cannot rotate a token that outlives it.',
 		details: { missing_scopes: missing },
@@ -214,8 +242,73 @@ export const tokenOperationDefinitions: Record<
 					? {
 							scopes: ctx.principal.token.scopes,
 							maxExpiresAt: ctx.principal.token.max_expires_at,
+							profileName: ctx.principal.token.profile_name ?? null,
 						}
 					: undefined
+			const callerProfileName = readCallerConnectionProfileName(
+				ctx.callerContext,
+			)
+			let profileName: string | null = null
+			if (input.profile !== undefined) {
+				profileName = normalizeConnectionProfileName(input.profile)
+				const nameError = getConnectionProfileNameValidationError(profileName)
+				if (nameError) {
+					throw invalidRequest(connectionProfileNameErrorMessage(nameError))
+				}
+				const userRow = await ctx.env.APP_DB.prepare(
+					`SELECT id FROM users WHERE stable_user_id = ?`,
+				)
+					.bind(userIdOf(ctx))
+					.first<{ id: number }>()
+				const enabled =
+					userRow != null &&
+					(await isFeatureEnabled(
+						ctx.env.APP_DB,
+						connectionProfilesFlagKey,
+						userRow.id,
+					))
+				if (!enabled) {
+					throw new ApiError({
+						status: 404,
+						code: 'not_found',
+						message: 'Connection profiles are not enabled for this account.',
+					})
+				}
+				const profile = await getConnectionProfileByName({
+					db: ctx.env.APP_DB,
+					userId: userIdOf(ctx),
+					name: profileName,
+				})
+				if (!profile) {
+					throw notFound(`Connection profile "${profileName}" not found.`)
+				}
+				profileName = profile.name
+			} else if (parent?.profileName) {
+				profileName = parent.profileName
+			} else if (callerProfileName) {
+				// MCP OAuth / session callers inherit their stamped profile so they
+				// cannot mint an unlimited token by omitting `profile`.
+				profileName = callerProfileName
+			}
+			if (
+				callerProfileName &&
+				profileName &&
+				callerProfileName !== profileName
+			) {
+				throw new ApiError({
+					status: 403,
+					code: 'insufficient_scope',
+					message: `This connection profile can only mint tokens for profile "${callerProfileName}".`,
+				})
+			}
+			if (callerProfileName && !profileName) {
+				throw new ApiError({
+					status: 403,
+					code: 'insufficient_scope',
+					message:
+						'This connection profile cannot mint an unlimited API token.',
+				})
+			}
 			return mintApiToken({
 				db: ctx.env.APP_DB,
 				userId: userIdOf(ctx),
@@ -229,6 +322,7 @@ export const tokenOperationDefinitions: Record<
 					: { maxLifetimeSeconds: input.max_lifetime_seconds }),
 				createdVia: ctx.principal.kind === 'token' ? 'api' : 'mcp-api',
 				...(parent ? { parent } : {}),
+				profileName,
 			})
 		},
 	},
