@@ -153,6 +153,9 @@ export async function persistForkedArtifactRepoContents(input: {
 		existingHeadCommit: destHead.commit,
 		bootstrapAccess: input.bootstrapAccess ?? null,
 		serverTiming: input.serverTiming,
+		// Same as ordinary community persist: installer checks decide live vs
+		// adaptation_required after the fork source is stamped.
+		runPublishChecks: false,
 	})
 	return {
 		copiedOriginCommit: destHead.commit,

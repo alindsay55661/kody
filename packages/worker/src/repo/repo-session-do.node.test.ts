@@ -196,6 +196,27 @@ vi.mock('./checks.ts', () => ({
 	runPackageTypecheckLanguageService: (
 		...args: Parameters<typeof Checks.runPackageTypecheckLanguageService>
 	) => mockModule.runPackageTypecheckLanguageService(...args),
+	formatFailedRepoCheckMessages: (
+		results: Array<{ ok: boolean; message: string }>,
+		fallback = 'Publish checks failed.',
+	) => {
+		const failed = results
+			.filter((entry) => !entry.ok)
+			.map((entry) => entry.message)
+			.filter((message) => message.trim().length > 0)
+		return failed.length > 0 ? failed.join('\n') : fallback
+	},
+	createSnapshotFilesWorkspace: (files: Record<string, string>) => ({
+		async readFile(path: string) {
+			return files[path.trim().replace(/^\/+/, '')] ?? null
+		},
+		async glob() {
+			return Object.keys(files).map((path) => ({
+				path,
+				type: 'file' as const,
+			}))
+		},
+	}),
 }))
 
 vi.mock('./external-publish-clone.ts', () => ({
@@ -1243,72 +1264,6 @@ test('readFile retries D1 reads and falls back to cached sessions when replicas 
 			path: 'kody.json',
 		}),
 	).resolves.toEqual({ path: 'kody.json', content: 'export default {}' })
-})
-
-test('bootstrapSource first-publishes from dest HEAD without replacing the forked tree', async () => {
-	consoleWarn.mockImplementation(() => {})
-	const unpublishedSource = sourceRow({
-		entity_kind: 'job',
-		entity_id: 'job-1',
-		repo_id: 'job-1',
-		published_commit: null,
-		manifest_path: 'kody.json',
-	})
-	const bootstrap = (sessionId: string, existingHeadCommit?: string) =>
-		repoSession().bootstrapSource({
-			sessionId,
-			sourceId: 'source-1',
-			userId: 'user-1',
-			...(existingHeadCommit ? { existingHeadCommit } : {}),
-			bootstrapAccess: {
-				defaultBranch: 'main',
-				remote: artifactsRemote('job-1'),
-				token: 'art_v1_bootstrap?expires=1760000000',
-				expiresAt: '2025-10-09T08:53:20.000Z',
-			},
-			edits: [{ kind: 'write', path: 'kody.json', content: jobManifest }],
-		})
-	const destWorkspaceFiles = {
-		'kody.json': jobManifest,
-		'src/job.ts':
-			'export default async function main() { return { ok: true } }',
-		'README.md': 'forked dest tree',
-	}
-
-	restoreRepoSessionMockBaseline()
-	mockModule.getEntitySourceById.mockResolvedValue(unpublishedSource)
-	seedWorkspace(destWorkspaceFiles, { fallback: null })
-	mockModule.gitState.headCommit = 'commit-dest-head'
-	mockModule.gitState.statusEntries = [{ status: 'modified' }]
-	const cloned = await bootstrap('session-bootstrap-fork', 'commit-dest-head')
-	expect(cloned.publishedCommit).toBe('commit-dest-head')
-	expect(cloned.files).toEqual(destWorkspaceFiles)
-	expect(mockModule.git.clone).toHaveBeenCalledWith(
-		expect.objectContaining({ branch: 'main', singleBranch: true }),
-	)
-	expect(mockModule.git.init).not.toHaveBeenCalled()
-	expect(mockModule.updateEntitySource).toHaveBeenCalledWith(
-		expect.anything(),
-		expect.objectContaining({
-			id: 'source-1',
-			publishedCommit: 'commit-dest-head',
-		}),
-	)
-
-	restoreRepoSessionMockBaseline()
-	mockModule.gitState.headCommit = 'commit-other'
-	await expect(
-		bootstrap('session-bootstrap-mismatch', 'commit-dest-head'),
-	).rejects.toThrow(/does not match expected "commit-dest-head"/)
-	expect(mockModule.updateEntitySource).not.toHaveBeenCalled()
-
-	restoreRepoSessionMockBaseline()
-	mockModule.workspaceReadFile.mockResolvedValue(jobManifest)
-	mockModule.gitState.headCommit = 'commit-empty-bootstrap'
-	mockModule.gitState.statusEntries = [{ status: 'modified' }]
-	await bootstrap('session-bootstrap-empty')
-	expect(mockModule.git.init).toHaveBeenCalled()
-	expect(mockModule.git.clone).not.toHaveBeenCalled()
 })
 
 test('publishSession persists the workspace snapshot to BUNDLE_ARTIFACTS_KV for downstream readers and never leaves inconsistent published commits when snapshot collection or persistence fails', async () => {

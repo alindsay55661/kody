@@ -68,6 +68,7 @@ import {
 	runPackageTypecheckLanguageService,
 	runRepoChecks,
 	runRepoSourceWalkChecks,
+	formatFailedRepoCheckMessages,
 	validatePackageBundles,
 } from './checks.ts'
 import {
@@ -1613,6 +1614,23 @@ class RepoSessionBase extends DurableObject<Env> {
 		userId: string
 		bootstrapAccess?: ArtifactBootstrapAccess | null
 		existingHeadCommit?: string
+		/**
+		 * Forwarded to `runRepoChecks`. Community forks may also set
+		 * `runPublishChecks: false` so install can persist an inert source
+		 * before its own checks choose live vs adaptation. Default matches
+		 * `publishFromExternalRef` (docs required) when checks run.
+		 */
+		requirePackageDocs?: boolean
+		/**
+		 * When false, skip the throwing publish-check gate. Community install
+		 * persists first and evaluates checks separately.
+		 */
+		runPublishChecks?: boolean
+		/**
+		 * Forwarded to `runRepoChecks` so bootstrap rejects a wrong
+		 * `package.json#name` scope before advancing published_commit.
+		 */
+		expectedPackageScope?: string
 		edits: Array<{
 			kind: 'write' | 'replace' | 'writeJson'
 			path: string
@@ -1744,6 +1762,39 @@ class RepoSessionBase extends DurableObject<Env> {
 				return commit
 			},
 		)
+		if (source.entity_kind === 'package' && input.runPublishChecks !== false) {
+			await pushServerTiming(
+				serverTiming,
+				'bootstrap-repo-checks',
+				async () => {
+					const manifestPath = resolveRepoWorkspacePath(
+						source.manifest_path,
+						repoSessionWorkspacePrefix,
+					)
+					const sourceRoot = resolveRepoWorkspacePath(
+						source.source_root || repoSessionWorkspacePrefix,
+						repoSessionWorkspacePrefix,
+					)
+					const checks = await runRepoChecks({
+						workspace: this.workspace,
+						manifestPath,
+						sourceRoot,
+						env: this.env,
+						baseUrl: source.source_root,
+						userId: input.userId,
+						...(input.expectedPackageScope !== undefined
+							? { expectedPackageScope: input.expectedPackageScope }
+							: {}),
+						...(input.requirePackageDocs === false
+							? { requirePackageDocs: false }
+							: {}),
+					})
+					if (!checks.ok) {
+						throw new Error(formatFailedRepoCheckMessages(checks.results))
+					}
+				},
+			)
+		}
 		const snapshotFiles = await pushServerTiming(
 			serverTiming,
 			'bootstrap-workspace-snapshot',
@@ -2388,6 +2439,11 @@ class RepoSessionBase extends DurableObject<Env> {
 		sessionId: string
 		userId: string
 		expectedPackageScope?: string
+		/**
+		 * Forwarded to `runRepoChecks`. Codemod / community lanes may pass
+		 * `false`; authoring publish defaults to requiring docs.
+		 */
+		requirePackageDocs?: boolean
 	}): Promise<RepoSessionCheckRun> {
 		const { sessionRow, source } = await this.getSessionState(
 			input.sessionId,
@@ -2411,6 +2467,9 @@ class RepoSessionBase extends DurableObject<Env> {
 			// Honor an explicit scope even on a still-plain repo: promote
 			// runs package checks before flipping entity_kind.
 			expectedPackageScope: input.expectedPackageScope,
+			...(input.requirePackageDocs === false
+				? { requirePackageDocs: false }
+				: {}),
 		})
 		const { sourceFiles: _sourceFiles, ...publicResult } = result
 		const runId = crypto.randomUUID()
@@ -2450,6 +2509,50 @@ class RepoSessionBase extends DurableObject<Env> {
 		)
 		await this.touchRepoSession(sessionRow)
 		return this.readCheckStatus()
+	}
+
+	/**
+	 * Stamp an ok check-status for the current workspace tree without running
+	 * validators. Trusted opt-out for community inert-fork persist
+	 * (`runPublishChecks: false`): publishSession can then proceed without
+	 * `force`, so the destructive-overwrite gate stays intact. Do not use this
+	 * to weaken `publishFromExternalRef` / packageSave (those keep real checks).
+	 */
+	async acceptCurrentTreeForPublish(input: {
+		sessionId: string
+		userId: string
+	}): Promise<RepoSessionCheckStatus> {
+		const { sessionRow } = await this.getSessionState(
+			input.sessionId,
+			input.userId,
+		)
+		const runId = crypto.randomUUID()
+		const treeHash = await this.computeTreeHash()
+		const checkedAt = nowIso()
+		const status: RepoSessionCheckStatus = {
+			runId,
+			treeHash,
+			checkedAt,
+			ok: true,
+			results: [
+				{
+					kind: 'manifest',
+					ok: true,
+					message:
+						'Publish checks accepted without running validators (trusted opt-out).',
+				},
+			],
+		}
+		await updateRepoSession(this.env, {
+			id: input.sessionId,
+			userId: sessionRow.user_id,
+			lastCheckRunId: runId,
+			lastCheckTreeHash: treeHash,
+			lastCheckpointAt: checkedAt,
+		})
+		await this.writeCheckStatus(status)
+		this.refreshStoredEstimate(input.sessionId, sessionRow.user_id)
+		return status
 	}
 
 	/**
