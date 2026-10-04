@@ -10,6 +10,7 @@ import {
 } from './scopes.ts'
 import {
 	apiTokenPolicy,
+	cliBootstrapTokenLifetimePolicy,
 	mintApiToken,
 	type ApiTokenMintParent,
 	type ApiTokenSecretView,
@@ -33,6 +34,12 @@ export const cliCredentialBootstrapPolicy = {
 		'local-execute',
 		'account:read',
 	] as const satisfies ReadonlyArray<ApiTokenScope>,
+	defaultIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.defaultIdleTtlSeconds,
+	minIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.minIdleTtlSeconds,
+	maxIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.maxIdleTtlSeconds,
+	defaultMaxLifetimeSeconds:
+		cliBootstrapTokenLifetimePolicy.defaultMaxLifetimeSeconds,
+	maxMaxLifetimeSeconds: cliBootstrapTokenLifetimePolicy.maxMaxLifetimeSeconds,
 	cliCommand: (code: string) =>
 		`npx @kodycodes/cli auth bootstrap --code ${code}`,
 } as const
@@ -203,28 +210,56 @@ export async function mintCliCredentialBootstrap(input: {
 		}
 	}
 
+	const parentRemainingSeconds = parent
+		? Math.floor((Date.parse(parent.maxExpiresAt) - now.getTime()) / 1000)
+		: null
+	if (
+		parentRemainingSeconds !== null &&
+		parentRemainingSeconds < cliCredentialBootstrapPolicy.minIdleTtlSeconds
+	) {
+		throw new McpCallerError(
+			'The calling API token expires too soon to mint a CLI bootstrap code.',
+		)
+	}
+
+	// Ordinary API-token parents max out at 7 days, below the 14-day bootstrap
+	// idle default. When the caller omits lifetimes, clamp defaults to the
+	// parent's remaining life so tokens:write callers still get a code.
+	// Explicit idle/max above the parent remaining still fail below.
+	const idleFallback =
+		parentRemainingSeconds === null
+			? cliCredentialBootstrapPolicy.defaultIdleTtlSeconds
+			: Math.min(
+					cliCredentialBootstrapPolicy.defaultIdleTtlSeconds,
+					parentRemainingSeconds,
+				)
 	const idleTtlSeconds = readIntegerOption({
 		value: input.idleTtlSeconds,
-		fallback: apiTokenPolicy.defaultIdleTtlSeconds,
-		min: apiTokenPolicy.minIdleTtlSeconds,
-		max: apiTokenPolicy.maxIdleTtlSeconds,
+		fallback: idleFallback,
+		min: cliCredentialBootstrapPolicy.minIdleTtlSeconds,
+		max: cliCredentialBootstrapPolicy.maxIdleTtlSeconds,
 		field: 'idle_ttl_seconds',
 	})
+	const maxFallbackBase = Math.max(
+		cliCredentialBootstrapPolicy.defaultMaxLifetimeSeconds,
+		idleTtlSeconds,
+	)
+	const maxFallback =
+		parentRemainingSeconds === null
+			? maxFallbackBase
+			: Math.max(
+					idleTtlSeconds,
+					Math.min(maxFallbackBase, parentRemainingSeconds),
+				)
 	const maxLifetimeSeconds = readIntegerOption({
 		value: input.maxLifetimeSeconds,
-		fallback: Math.max(
-			apiTokenPolicy.defaultMaxLifetimeSeconds,
-			idleTtlSeconds,
-		),
+		fallback: maxFallback,
 		min: idleTtlSeconds,
-		max: apiTokenPolicy.maxMaxLifetimeSeconds,
+		max: cliCredentialBootstrapPolicy.maxMaxLifetimeSeconds,
 		field: 'max_lifetime_seconds',
 	})
 	let effectiveMaxLifetimeSeconds = maxLifetimeSeconds
-	if (parent) {
-		const parentRemainingSeconds = Math.floor(
-			(Date.parse(parent.maxExpiresAt) - now.getTime()) / 1000,
-		)
+	if (parentRemainingSeconds !== null) {
 		if (parentRemainingSeconds < idleTtlSeconds) {
 			throw new McpCallerError(
 				'The calling API token expires too soon to mint a CLI bootstrap code.',
