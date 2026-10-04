@@ -4,7 +4,7 @@ import { type EntitySourceRow } from '#worker/repo/types.ts'
 
 const sourceSnapshotVersion = 1
 const sourceManifestSnapshotVersion = 1
-const bundleArtifactVersion = 1
+export const bundleArtifactVersion = 1
 const sourceSnapshotPrefix = 'source-snapshot'
 const sourceManifestSnapshotPrefix = 'source-manifest-snapshot'
 const bundleArtifactPrefix = 'bundle-artifact'
@@ -134,13 +134,6 @@ export type PublishedBundleArtifact = {
 		kodyId: string
 		sourceId: string
 	} | null
-	/**
-	 * Platform-injected Remix versions bundled into this artifact via
-	 * `withPlatformRemixFiles`. Absent on older artifacts; reuse treats a
-	 * missing or mismatched pair as dirty so a platform Remix bump rebuilds.
-	 */
-	remixVersion?: string
-	remixUiVersion?: string
 	createdAt: string
 }
 
@@ -149,6 +142,30 @@ type StoredPublishedBundleArtifact = Omit<
 	'modules'
 > & {
 	modules: Record<string, SerializedWorkerLoaderModule>
+	/**
+	 * Present on platform-injection-built artifacts from before decision
+	 * 0057. Readers reject those payloads so Remix-injected modules stop
+	 * serving without orphaning ordinary npm-backed v1 artifacts.
+	 */
+	remixVersion?: string
+	remixUiVersion?: string
+}
+
+/**
+ * True when a stored bundle artifact may keep serving. Rejects wrong
+ * versions, missing modules, and platform-injection-built payloads that
+ * stamped `remixVersion` / `remixUiVersion`.
+ */
+export function isUsableStoredPublishedBundleArtifact(artifact: {
+	version?: unknown
+	modules?: unknown
+	remixVersion?: unknown
+	remixUiVersion?: unknown
+}) {
+	if (artifact.version !== bundleArtifactVersion) return false
+	if (typeof artifact.remixVersion === 'string') return false
+	if (typeof artifact.remixUiVersion === 'string') return false
+	return typeof artifact.modules === 'object' && artifact.modules != null
 }
 
 function getBundleArtifactsKv(env: Env) {
@@ -499,11 +516,7 @@ export async function readPublishedBundleArtifact(input: {
 	const stored = await getBundleArtifactsKv(input.env).get(input.kvKey, 'json')
 	if (!stored || typeof stored !== 'object') return null
 	const artifact = stored as StoredPublishedBundleArtifact
-	if (
-		artifact.version !== bundleArtifactVersion ||
-		typeof artifact.modules !== 'object' ||
-		artifact.modules == null
-	) {
+	if (!isUsableStoredPublishedBundleArtifact(artifact)) {
 		return null
 	}
 	return {
@@ -522,12 +535,6 @@ export async function readPublishedBundleArtifact(input: {
 					sourceId: artifact.packageContext.sourceId ?? artifact.sourceId,
 				}
 			: null,
-		...(typeof artifact.remixVersion === 'string'
-			? { remixVersion: artifact.remixVersion }
-			: {}),
-		...(typeof artifact.remixUiVersion === 'string'
-			? { remixUiVersion: artifact.remixUiVersion }
-			: {}),
 		modules: deserializeWorkerLoaderModules(artifact.modules),
 		createdAt: artifact.createdAt,
 	} satisfies PublishedBundleArtifact
