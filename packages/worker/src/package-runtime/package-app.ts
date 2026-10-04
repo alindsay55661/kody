@@ -92,11 +92,18 @@ import {
 	resolvePackageAppClientArtifact,
 } from './package-app-assets.ts'
 import { recordUniqueDynamicWorkerDay } from '#worker/usage/dynamic-worker-day.ts'
+import {
+	createNullPackagesInvokeRewriteHostSource,
+	modulesContainUnboundPackagesInvokeAccess,
+} from './unbound-runtime-helpers.ts'
 
 const packageAppEntrypointName = 'PackageAppWorker'
 const packageAppRuntimeBindingName = 'KODY_RUNTIME'
 
-function createPackageAppWorkerSource(input: { mainModule: string }) {
+function createPackageAppWorkerSource(input: {
+	mainModule: string
+	rewriteNullPackagesInvoke: boolean
+}) {
 	return `
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -637,6 +644,10 @@ function serializeRuntimeError(error) {
 	};
 }
 
+${createNullPackagesInvokeRewriteHostSource({
+	enabled: input.rewriteNullPackagesInvoke,
+})}
+
 function createConsoleLogCapture() {
 	const logs = [];
 	const previousConsole = globalThis.console;
@@ -789,13 +800,14 @@ export class ${packageAppEntrypointName} extends WorkerEntrypoint {
 			});
 			return response;
 		} catch (error) {
+			const enrichedError = enrichUnboundPackagesInvokeError(error);
 			finishRuntimeRun(runtimeBridge, this.ctx, {
 				run: runtimeRun,
 				status: 'error',
-				error: serializeRuntimeError(error),
+				error: serializeRuntimeError(enrichedError),
 				logs: consoleCapture.logs,
 			});
-			throw error;
+			throw enrichedError;
 		} finally {
 			consoleCapture.restore();
 		}
@@ -853,13 +865,14 @@ export class ${packageAppEntrypointName} extends WorkerEntrypoint {
 			});
 			return result;
 		} catch (error) {
+			const enrichedError = enrichUnboundPackagesInvokeError(error);
 			finishRuntimeRun(runtimeBridge, this.ctx, {
 				run: runtimeRun,
 				status: 'error',
-				error: serializeRuntimeError(error),
+				error: serializeRuntimeError(enrichedError),
 				logs: consoleCapture.logs,
 			});
-			throw error;
+			throw enrichedError;
 		} finally {
 			consoleCapture.restore();
 		}
@@ -1859,6 +1872,8 @@ async function buildPackageAppWorkerOptionsUncached(input: {
 		...hydratedModules,
 		[mainModule]: createPackageAppWorkerSource({
 			mainModule: bundled.mainModule,
+			rewriteNullPackagesInvoke:
+				modulesContainUnboundPackagesInvokeAccess(hydratedModules),
 		}),
 	}
 	return {
