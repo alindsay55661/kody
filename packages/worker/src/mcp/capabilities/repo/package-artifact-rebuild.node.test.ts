@@ -391,3 +391,81 @@ test('does not retry non-transient rebuild failures', async () => {
 		1,
 	)
 })
+
+test('undeclared bare-import rebuild failures rehydrate as UserCodeError; declared stay platform Errors', async () => {
+	const { isUserCodeError, UserCodeError } =
+		await import('#worker/user-code-error.ts')
+	const undeclaredMessage =
+		'Saved package module "src/a.ts" bundle still contains unresolved bare package imports after bundling (bundle.js: "remix/data-schema"). Declare supported runtime dependencies in package.json and ensure checks/publish can resolve them before execution.'
+
+	const callerRun = vi.fn(async (input: { targets: Array<Target> }) => ({
+		ok: false,
+		message: undeclaredMessage,
+		results: input.targets.map((target) => ({
+			ok: false,
+			message: undeclaredMessage,
+			callerFailure: true,
+			target,
+		})),
+	}))
+	setup({ targets: [sampleTargets[0]!], run: callerRun })
+	await expect(rebuild()).rejects.toSatisfy((error: unknown) => {
+		expect(error).toBeInstanceOf(UserCodeError)
+		expect(isUserCodeError(error)).toBe(true)
+		expect(String(error)).toMatch(/unresolved bare package imports/)
+		return true
+	})
+
+	const platformRun = vi.fn(async (input: { targets: Array<Target> }) => ({
+		ok: false,
+		message: undeclaredMessage,
+		results: input.targets.map((target) => ({
+			ok: false,
+			message: undeclaredMessage,
+			target,
+		})),
+	}))
+	setup({ targets: [sampleTargets[0]!], run: platformRun })
+	await expect(rebuild()).rejects.toSatisfy((error: unknown) => {
+		expect(error).toBeInstanceOf(Error)
+		expect(error).not.toBeInstanceOf(UserCodeError)
+		expect(isUserCodeError(error)).toBe(false)
+		return true
+	})
+})
+
+test('mixed caller and platform rebuild failures keep a platform cause for Sentry', async () => {
+	const { isUserCodeError, UserCodeError } =
+		await import('#worker/user-code-error.ts')
+	const callerMessage =
+		'Saved package module "src/a.ts" bundle still contains unresolved bare package imports after bundling (bundle.js: "remix/data-schema").'
+	const platformMessage = 'KV PUT failed: 500 Internal Server Error'
+	const run = vi.fn(async (input: { targets: Array<Target> }) => ({
+		ok: false,
+		message: 'mixed failures',
+		results: input.targets.map((target, index) =>
+			index === 0
+				? {
+						ok: false,
+						message: callerMessage,
+						callerFailure: true,
+						target,
+					}
+				: {
+						ok: false,
+						message: platformMessage,
+						target,
+					},
+		),
+	}))
+	setup({ targets: sampleTargets.slice(0, 2), run })
+	await expect(rebuild()).rejects.toSatisfy((error: unknown) => {
+		expect(error).toBeInstanceOf(Error)
+		expect(error).not.toBeInstanceOf(UserCodeError)
+		expect(isUserCodeError(error)).toBe(false)
+		expect((error as Error).cause).toBeInstanceOf(Error)
+		expect((error as Error).cause).not.toBeInstanceOf(UserCodeError)
+		expect(String((error as Error).cause)).toContain(platformMessage)
+		return true
+	})
+})
