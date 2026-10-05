@@ -18,7 +18,12 @@ import {
 	loadPublishedBundleArtifactByIdentity,
 	persistPublishedBundleArtifact,
 } from '#worker/package-runtime/published-bundle-artifacts.ts'
-import { assertPublishedSourceCanRebuildWithoutInstallingDeps } from '#worker/package-runtime/published-source-dependencies.ts'
+import {
+	assertPublishedSourceCanRebuildWithoutInstallingDeps,
+	isPublishedRuntimeBundleMissingError,
+	isPublishedSourceWithinNpmBundleRebuildWindow,
+	listMissingPublishedSourceInstalledDependencies,
+} from '#worker/package-runtime/published-source-dependencies.ts'
 import {
 	buildPackageSubscriptionArtifactName,
 	normalizePackageSubscriptionTopic,
@@ -206,6 +211,35 @@ async function ensureModuleArtifactUncached(input: {
 		manifest: packageSource.manifest,
 		selector: input.selector,
 	})
+	// External publish flips `published_commit` before the per-target rebuild
+	// finishes. Invoke-contract-cache already serves a cross-commit identity
+	// hit without retaining it; do the same here when source cannot rebuild
+	// (npm deps live only in the published runtime bundle), and only while
+	// the published snapshot `createdAt` (the finalize clock) is still inside
+	// the rebuild window. `entity_sources.updated_at` is the wrong clock: any
+	// later row write would reopen stale serving. After the window the
+	// missing-bundle error is retryable so a failed rebuild stays visible.
+	if (
+		listMissingPublishedSourceInstalledDependencies(packageSource.files)
+			.length > 0
+	) {
+		if (
+			loaded?.artifact &&
+			isPublishedSourceWithinNpmBundleRebuildWindow({
+				publishedAt: packageSource.snapshotCreatedAt,
+			})
+		) {
+			return {
+				artifact: loaded.artifact,
+				source: packageSource.source,
+				entryPoint: loaded.artifact.entryPoint,
+			}
+		}
+		assertPublishedSourceCanRebuildWithoutInstallingDeps({
+			sourceFiles: packageSource.files,
+			bundleLabel: `Saved package export "${freshResolution.artifactName}"`,
+		})
+	}
 	const typecheckResult = await typecheckPackageEntrypointsFromSourceFiles({
 		sourceFiles: packageSource.files,
 		entryPoints: [{ path: freshResolution.entryPoint }],
@@ -214,10 +248,6 @@ async function ensureModuleArtifactUncached(input: {
 	if (!typecheckResult.ok) {
 		throw new Error(typecheckResult.message)
 	}
-	assertPublishedSourceCanRebuildWithoutInstallingDeps({
-		sourceFiles: packageSource.files,
-		bundleLabel: `Saved package export "${freshResolution.artifactName}"`,
-	})
 	const { buildKodyModuleBundle } =
 		await import('#worker/package-runtime/module-graph.ts')
 	const bundle = await buildKodyModuleBundle({
@@ -320,6 +350,7 @@ export function isMissingPackageModuleError(error: unknown) {
 
 export function isTransientModuleArtifactError(error: unknown) {
 	if (isRetryableD1LockError(error)) return true
+	if (isPublishedRuntimeBundleMissingError(error)) return true
 	if (!(error instanceof Error)) return false
 	return /(?:\bD1\b|\bKV\b|bindings? (?:are|is) not available|timeout|temporar|network|fetch|could not be loaded after rebuild)/i.test(
 		error.message,
