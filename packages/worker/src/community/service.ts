@@ -45,10 +45,15 @@ import {
 import {
 	forkArtifactRepo,
 	persistForkedArtifactRepoContents,
+	resolveCommunityForkArtifactsGitFallbackTree,
 	shouldFallbackFromArtifactFork,
+	shouldFallbackFromForkedArtifactPersist,
 } from '#worker/repo/artifact-repo-fork.ts'
 import { readPublishedSourceSnapshot } from '#worker/package-runtime/published-runtime-artifacts.ts'
-import { ensureEntitySource } from '#worker/repo/source-service.ts'
+import {
+	ensureEntitySource,
+	type EnsuredEntitySource,
+} from '#worker/repo/source-service.ts'
 import { syncArtifactSourceSnapshot } from '#worker/repo/source-sync.ts'
 import { shouldStripIdentityIconFromCommunitySnapshot } from '#worker/repo/identity-icon-paths.ts'
 import {
@@ -1564,7 +1569,7 @@ export async function persistPreparedCommunityFork(
 			}
 		}
 	}
-	let ensuredSource
+	let ensuredSource: EnsuredEntitySource
 	try {
 		ensuredSource = await ensureEntitySource({
 			db: prepared.env.APP_DB,
@@ -1587,21 +1592,97 @@ export async function persistPreparedCommunityFork(
 	}
 	try {
 		let originCommit = prepared.originCommit
+		let syncedFiles = prepared.files
 		if (copiedAtStorageLayer) {
-			const persisted = await persistForkedArtifactRepoContents({
-				env: prepared.env,
-				baseUrl: prepared.baseUrl,
-				userId: prepared.userId,
-				source: ensuredSource,
-				originCommit: prepared.originCommit,
-				expectedPackageScope: prepared.expectedPackageScope,
-				targetKodyId: prepared.targetKodyId,
-				changedFiles: prepared.changedFiles,
-				files: prepared.files,
-				bootstrapAccess: ensuredSource.bootstrapAccess ?? null,
-				serverTiming,
-			})
-			originCommit = persisted.copiedOriginCommit
+			try {
+				const persisted = await persistForkedArtifactRepoContents({
+					env: prepared.env,
+					baseUrl: prepared.baseUrl,
+					userId: prepared.userId,
+					source: ensuredSource,
+					originCommit: prepared.originCommit,
+					expectedPackageScope: prepared.expectedPackageScope,
+					targetKodyId: prepared.targetKodyId,
+					changedFiles: prepared.changedFiles,
+					files: prepared.files,
+					bootstrapAccess: ensuredSource.bootstrapAccess ?? null,
+					serverTiming,
+				})
+				originCommit = persisted.copiedOriginCommit
+			} catch (error) {
+				// Storage-layer fork can leave a dest whose git clone fails with
+				// persistent Artifacts HTTP 5xx / corrupt pack even when origin
+				// is healthy. Fall back to writing a full tree into a fresh empty
+				// repo. Prefer dest HEAD from origin when preparation still holds
+				// an older listing-pin snapshot.
+				if (!shouldFallbackFromForkedArtifactPersist(error)) {
+					throw error
+				}
+				const fallbackTree = await resolveCommunityForkArtifactsGitFallbackTree(
+					{
+						env: prepared.env,
+						destRepoId,
+						originRepoId: prepared.originRepoId,
+						preparedOriginCommit: prepared.originCommit,
+						preparedFiles: prepared.files,
+						expectedPackageScope: prepared.expectedPackageScope,
+						targetKodyId: prepared.targetKodyId,
+						listingName: prepared.listingName,
+						targetName: prepared.targetName,
+					},
+				)
+				if (!fallbackTree) {
+					throw error
+				}
+				const destDeleted = await deleteUserScopedArtifactRepo({
+					env: prepared.env,
+					userId: prepared.userId,
+					repoName: destRepoId,
+					waitUntilAbsent: true,
+				})
+				if (!destDeleted) {
+					throw error
+				}
+				console.info(
+					JSON.stringify({
+						message: 'community-fork-artifacts-git-fallback',
+						listingId: prepared.listingId,
+						packageId: prepared.packageId,
+						sourceId: ensuredSource.id,
+						originCommit: fallbackTree.originCommit,
+						preparedOriginCommit: prepared.originCommit,
+						error: getErrorMessage(error),
+					}),
+				)
+				copiedAtStorageLayer = false
+				ensuredSource = await ensureEntitySource({
+					db: prepared.env.APP_DB,
+					env: prepared.env,
+					userId: prepared.userId,
+					entityKind: 'package',
+					entityId: prepared.packageId,
+					requirePersistence: true,
+					serverTiming,
+				})
+				if (!ensuredSource.bootstrapAccess) {
+					throw error
+				}
+				originCommit = fallbackTree.originCommit
+				syncedFiles = fallbackTree.files
+				const snapshotCommit = await syncArtifactSourceSnapshot({
+					env: prepared.env,
+					baseUrl: prepared.baseUrl,
+					userId: prepared.userId,
+					sourceId: ensuredSource.id,
+					files: syncedFiles,
+					bootstrapAccess: ensuredSource.bootstrapAccess,
+					serverTiming,
+					runPublishChecks: false,
+				})
+				if (snapshotCommit == null) {
+					throw error
+				}
+			}
 		} else {
 			await syncArtifactSourceSnapshot({
 				env: prepared.env,
@@ -1644,7 +1725,7 @@ export async function persistPreparedCommunityFork(
 			durationMs: Date.now() - persistStartedAt,
 			listingId: prepared.listingId,
 			packageId: prepared.packageId,
-			filesCount: Object.keys(prepared.files).length,
+			filesCount: Object.keys(syncedFiles).length,
 		})
 
 		return {
@@ -1655,8 +1736,8 @@ export async function persistPreparedCommunityFork(
 			targetName: prepared.targetName,
 			originCommit,
 			crossScopeReferences: prepared.crossScopeReferences,
-			filesCount: Object.keys(prepared.files).length,
-			files: prepared.files,
+			filesCount: Object.keys(syncedFiles).length,
+			files: syncedFiles,
 			...(serverTiming && serverTiming.length > 0 ? { serverTiming } : {}),
 		}
 	} catch (error) {
