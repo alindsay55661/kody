@@ -2,7 +2,9 @@ import { expect, test } from 'vitest'
 import {
 	classifyReviewBotComment,
 	classifyReviewBotComments,
+	findingHasAddressingReply,
 	invalidReplyBody,
+	isAddressingReviewReply,
 	isShipPrBlocker,
 	reviewBotKind,
 } from './classify-review-bot.mjs'
@@ -118,4 +120,101 @@ test('review-bot sort maps Bugbot, Devin, and Seer; unsure stays a blocker', () 
 	expect(
 		findings.filter((finding) => finding.verdict === 'invalid'),
 	).toHaveLength(1)
+
+	expect(
+		isAddressingReviewReply({
+			id: 21,
+			user: { login: 'kody-bot' },
+			body: 'Fixed in abcdef1 — the closed-world runtime now allowlists that warn.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(true)
+	expect(
+		isAddressingReviewReply({
+			id: 22,
+			user: { login: 'kentcdodds' },
+			body: 'Intentional wontfix; leaving the fallback as-is.',
+			in_reply_to_id: 3,
+		}),
+	).toBe(true)
+	expect(
+		isAddressingReviewReply({
+			id: 23,
+			user: { login: 'cursor[bot]' },
+			body: 'Still a bug: fixed in abcdef1 would be nicer.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 24,
+			user: { login: 'kody-bot' },
+			body: 'Looking at this now.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 25,
+			user: { login: 'kody-bot' },
+			body: 'Fixed in a follow-up.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 26,
+			user: { login: 'kody-bot' },
+			body: 'abcdef1',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 27,
+			user: { login: 'kody-bot' },
+			body: 'This is not fixed in abcdef1.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 29,
+			user: { login: 'kody-bot' },
+			body: "This isn't fixed in abcdef1.",
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		isAddressingReviewReply({
+			id: 28,
+			user: { login: 'dependabot[bot]' },
+			body: 'Fixed in abcdef1.',
+			in_reply_to_id: 1,
+		}),
+	).toBe(false)
+	expect(
+		findingHasAddressingReply({ commentId: 1 }, [
+			{
+				id: 1,
+				user: { login: 'cursor[bot]' },
+				body: 'This is a bug: null pointer when the session is missing.',
+			},
+			{
+				id: 21,
+				user: { login: 'kody-bot' },
+				body: 'Addressed in abcdef1.',
+				in_reply_to_id: 1,
+			},
+		]),
+	).toBe(true)
+	expect(
+		findingHasAddressingReply({ commentId: 3 }, [
+			{
+				id: 3,
+				user: { login: 'seer[bot]' },
+				body: 'Consider whether this helper belongs closer to the call site.',
+			},
+		]),
+	).toBe(false)
 })

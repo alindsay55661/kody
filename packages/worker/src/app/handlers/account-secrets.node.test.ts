@@ -1096,6 +1096,133 @@ test('account secrets API loads selected secret values and deletes the selected 
 	)
 })
 
+test('account secrets save returns the new secret after a successful write', async () => {
+	mockModule.listSavedPackagesByUserId.mockResolvedValue([])
+	mockModule.listPackageSecretsByPackageIds.mockResolvedValue(new Map())
+	mockModule.listSecrets
+		.mockResolvedValueOnce([])
+		.mockResolvedValueOnce([makeSecret('newApiKey')])
+	mockModule.resolveSecret.mockResolvedValueOnce({
+		found: true,
+		value: 'fresh-secret',
+	} as never)
+
+	const call = createHandler()
+	const response = await call(
+		postRequest({
+			action: 'save',
+			name: 'newApiKey',
+			scope: 'user',
+			value: 'fresh-secret',
+			description: 'API key',
+			allowedHosts: [],
+			allowedPackages: [],
+		}),
+	)
+
+	expect(response.status).toBe(200)
+	await expect(response.json()).resolves.toMatchObject({
+		ok: true,
+		selectedSecret: {
+			id: 'user::::newApiKey',
+			name: 'newApiKey',
+			value: 'fresh-secret',
+		},
+	})
+	expect(mockModule.saveSecret).toHaveBeenCalledWith(
+		expect.objectContaining({
+			name: 'newApiKey',
+			value: 'fresh-secret',
+			scope: 'user',
+		}),
+	)
+})
+
+test('account secrets save stays ok when metadata reload fails after write', async () => {
+	mockModule.listSavedPackagesByUserId.mockResolvedValue([])
+	mockModule.listPackageSecretsByPackageIds.mockResolvedValue(new Map())
+	mockModule.listSecrets
+		.mockResolvedValueOnce([])
+		.mockRejectedValueOnce(new Error('metadata reload failed'))
+
+	const call = createHandler()
+	const response = await call(
+		postRequest({
+			action: 'save',
+			name: 'newApiKey',
+			scope: 'user',
+			value: 'fresh-secret',
+			description: 'API key',
+			allowedHosts: [],
+			allowedPackages: [],
+		}),
+	)
+
+	expect(response.status).toBe(200)
+	await expect(response.json()).resolves.toMatchObject({
+		ok: true,
+		selectedSecret: {
+			id: 'user::::newApiKey',
+			name: 'newApiKey',
+			value: 'fresh-secret',
+		},
+	})
+	expect(mockModule.saveSecret).toHaveBeenCalled()
+})
+
+test('account secrets save fallback uses the saved record metadata', async () => {
+	const existing = makeSecret('oldApiKey', {
+		ttlMs: 60_000,
+		expiresAt: '2026-10-06T00:00:00.000Z',
+	})
+	const savedAt = '2026-10-05T12:00:00.000Z'
+	const expiresAt = new Date(
+		Date.now() + 30 * 24 * 60 * 60 * 1000,
+	).toISOString()
+	mockModule.listSavedPackagesByUserId.mockResolvedValue([])
+	mockModule.listPackageSecretsByPackageIds.mockResolvedValue(new Map())
+	mockModule.listSecrets
+		.mockResolvedValueOnce([existing])
+		.mockRejectedValueOnce(new Error('metadata reload failed'))
+	mockModule.saveSecret.mockResolvedValueOnce({
+		name: 'renamedApiKey',
+		scope: 'user',
+		description: '',
+		packageId: null,
+		allowedHosts: [],
+		allowedPackages: [],
+		createdAt: savedAt,
+		updatedAt: savedAt,
+		expiresAt,
+		ttlMs: 2_592_000_000,
+	} as never)
+
+	const call = createHandler()
+	const response = await call(
+		postRequest({
+			action: 'save',
+			currentId: 'user::::oldApiKey',
+			name: 'renamedApiKey',
+			scope: 'user',
+			value: 'fresh-secret',
+			expiresAt,
+			allowedHosts: [],
+			allowedPackages: [],
+		}),
+	)
+
+	expect(response.status).toBe(200)
+	await expect(response.json()).resolves.toMatchObject({
+		ok: true,
+		selectedSecret: {
+			id: 'user::::renamedApiKey',
+			createdAt: savedAt,
+			expiresAt,
+			ttlMs: 2_592_000_000,
+		},
+	})
+})
+
 test('oauth_exchange maps provider failures and forwards exchange styles', async () => {
 	const fetchMock = vi.fn()
 	vi.stubGlobal('fetch', fetchMock)

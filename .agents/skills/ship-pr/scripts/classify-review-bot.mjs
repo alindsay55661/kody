@@ -34,8 +34,70 @@ export const reviewBotLogins = [
  *   user: { login: string }
  *   body: string
  *   html_url?: string
+ *   in_reply_to_id?: number | null
  * }} ClassifiableComment
  */
+
+/**
+ * Human / kody-bot reply that cites a fixing commit or an intentional wontfix.
+ * Review-bot authors and other automation never count.
+ *
+ * @param {unknown} text
+ */
+export function isAddressingReviewReplyBody(text) {
+	const body = String(text ?? '')
+	if (
+		/(?:n't|\bnot\b|\bnever\b)\s+(?:been\s+)?(?:fixed|addressed|landed)\b/i.test(
+			body,
+		)
+	) {
+		return false
+	}
+	if (/\b(wont\s*fix|won't fix|will not fix)\b/i.test(body)) {
+		return true
+	}
+	return /\b(?:fixed|addressed|landed)\s+(?:in|by|with)\s+[0-9a-f]{7,40}\b/i.test(
+		body,
+	)
+}
+
+/**
+ * kody-bot or a non-bot human. Review bots and other `*bot*` / `[bot]`
+ * accounts cannot dismiss a finding.
+ *
+ * @param {unknown} login
+ */
+export function isAddressingReviewAuthor(login) {
+	const raw = String(login ?? '')
+	const normalized = normalizeBotLogin(raw)
+	if (!normalized || reviewBotKind(raw)) return false
+	if (normalized === 'kody-bot') return true
+	if (/\[bot\]$/i.test(raw)) return false
+	if (/(?:^|[-_])bot$/.test(normalized) || normalized.endsWith('bot')) {
+		return false
+	}
+	return true
+}
+
+/**
+ * @param {ClassifiableComment} comment
+ */
+export function isAddressingReviewReply(comment) {
+	if (!isAddressingReviewAuthor(comment.user?.login)) return false
+	return isAddressingReviewReplyBody(comment.body)
+}
+
+/**
+ * @param {{ commentId: number }} finding
+ * @param {Array<ClassifiableComment>} comments
+ */
+export function findingHasAddressingReply(finding, comments) {
+	return comments.some(
+		(comment) =>
+			comment.in_reply_to_id === finding.commentId &&
+			isAddressingReviewReply(comment),
+	)
+}
 
 /**
  * @param {unknown} text
