@@ -23,6 +23,10 @@ type ActiveUserRow = {
 	plan: string
 	stripe_plan: string | null
 	entitlement_ladder: string | null
+	stripe_credits_eligible?: number | null
+	admin_credits_eligible?: number | null
+	second_agent_standard_gift_expires_at?: string | null
+	referral_standard_credit_expires_at?: string | null
 	event_count: number
 }
 
@@ -131,6 +135,10 @@ function activeUser(
 		plan,
 		stripe_plan: null,
 		entitlement_ladder: 'public',
+		stripe_credits_eligible: 0,
+		admin_credits_eligible: 0,
+		second_agent_standard_gift_expires_at: null,
+		referral_standard_credit_expires_at: null,
 		event_count,
 		...overrides,
 	}
@@ -159,6 +167,7 @@ function consumptionCalls() {
 			usageUserId: input.usageUserId,
 			plan: input.plan,
 			ladder: input.ladder,
+			inboundReceivePlan: input.inboundReceive?.plan ?? null,
 		}),
 	)
 }
@@ -340,9 +349,24 @@ test('detectFleetUsagePressure flags entitlement, runtime, and unique-worker cos
 	])
 	expect(consumptionCalls()).toEqual(
 		expect.arrayContaining([
-			{ usageUserId: 'user-a', plan: 'free', ladder: 'public' },
-			{ usageUserId: 'user-b', plan: 'pro', ladder: 'public' },
-			{ usageUserId: 'user-admin', plan: 'max', ladder: 'public' },
+			{
+				usageUserId: 'user-a',
+				plan: 'free',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
+			{
+				usageUserId: 'user-b',
+				plan: 'pro',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
+			{
+				usageUserId: 'user-admin',
+				plan: 'max',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
 		]),
 	)
 })
@@ -381,8 +405,18 @@ test('fleet entitlement pressure scores legacy Standard against the legacy outbo
 	])
 	expect(consumptionCalls()).toEqual(
 		expect.arrayContaining([
-			{ usageUserId: 'grant', plan: 'standard', ladder: 'legacy' },
-			{ usageUserId: 'pat', plan: 'standard', ladder: 'public' },
+			{
+				usageUserId: 'grant',
+				plan: 'standard',
+				ladder: 'legacy',
+				inboundReceivePlan: null,
+			},
+			{
+				usageUserId: 'pat',
+				plan: 'standard',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
 		]),
 	)
 	const outboundSnapshot = (limit: number, overEightyPercent: boolean) => [
@@ -430,4 +464,203 @@ test('fleet entitlement pressure scores legacy Standard against the legacy outbo
 			pressuredResources: [patPressure],
 		},
 	])
+})
+
+test('fleet entitlement pressure scores temporary Pro gift overlays, not Free caps', async () => {
+	const packagesOverFree = 15
+	const freePackageLimit = 10
+	const publicProPackageLimit = 200
+	const receivesAtFreeCap = 10
+	const freeReceiveLimit = 10
+	const publicProReceiveLimit = 2_000
+	entitlementMocks.readAdminEntitlementConsumption.mockImplementation(
+		async (input) => {
+			const packageLimit =
+				input.plan === 'free' ? freePackageLimit : publicProPackageLimit
+			const receivePlan = input.inboundReceive?.plan ?? input.plan
+			const receiveLimit =
+				receivePlan === 'free' ? freeReceiveLimit : publicProReceiveLimit
+			return [
+				consumption(
+					'saved_packages',
+					'saved packages',
+					packagesOverFree,
+					packageLimit,
+				),
+				consumption(
+					'email_receives_per_day',
+					'email receives / day',
+					receivesAtFreeCap,
+					receiveLimit,
+				),
+			]
+		},
+	)
+	const giftExpiresAt = '2026-07-20T00:00:00.000Z'
+	const db = createFleetDb({
+		activeUsers: [
+			activeUser('gifted', 'continuumpraxis', 'free', 90, {
+				second_agent_standard_gift_expires_at: giftExpiresAt,
+			}),
+			activeUser('base-free', 'freefolk', 'free', 80),
+			activeUser('expired-gift', 'pastgift', 'free', 70, {
+				second_agent_standard_gift_expires_at: '2026-07-01T00:00:00.000Z',
+			}),
+			activeUser('referral-gift', 'referred', 'free', 60, {
+				referral_standard_credit_expires_at: giftExpiresAt,
+			}),
+		],
+	})
+	const env = { APP_DB: db } as Env
+	const [snapshots, issues, insights] = await Promise.all([
+		loadFleetEntitlementCrossingSnapshots({ db, env, now }),
+		detectFleetUsagePressure({ db, env, now }),
+		loadFleetUsageInsights({ db, env, now }),
+	])
+
+	expect(consumptionCalls()).toEqual(
+		expect.arrayContaining([
+			{
+				usageUserId: 'gifted',
+				plan: 'pro',
+				ladder: 'public',
+				inboundReceivePlan: 'free',
+			},
+			{
+				usageUserId: 'base-free',
+				plan: 'free',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
+			{
+				usageUserId: 'expired-gift',
+				plan: 'free',
+				ladder: 'public',
+				inboundReceivePlan: null,
+			},
+			{
+				usageUserId: 'referral-gift',
+				plan: 'pro',
+				ladder: 'public',
+				inboundReceivePlan: 'free',
+			},
+		]),
+	)
+
+	expect(snapshots).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				stableUserId: 'gifted',
+				plan: 'pro',
+				entitlements: expect.arrayContaining([
+					expect.objectContaining({
+						resource: 'saved_packages',
+						current: packagesOverFree,
+						limit: publicProPackageLimit,
+						overEightyPercent: false,
+					}),
+					expect.objectContaining({
+						resource: 'email_receives_per_day',
+						current: receivesAtFreeCap,
+						limit: freeReceiveLimit,
+						overEightyPercent: true,
+					}),
+				]),
+			}),
+			expect.objectContaining({
+				stableUserId: 'base-free',
+				plan: 'free',
+				entitlements: expect.arrayContaining([
+					expect.objectContaining({
+						resource: 'saved_packages',
+						current: packagesOverFree,
+						limit: freePackageLimit,
+						overEightyPercent: true,
+					}),
+				]),
+			}),
+			expect.objectContaining({
+				stableUserId: 'expired-gift',
+				plan: 'free',
+				entitlements: expect.arrayContaining([
+					expect.objectContaining({
+						limit: freePackageLimit,
+						overEightyPercent: true,
+					}),
+				]),
+			}),
+			expect.objectContaining({
+				stableUserId: 'referral-gift',
+				plan: 'pro',
+				entitlements: expect.arrayContaining([
+					expect.objectContaining({
+						resource: 'saved_packages',
+						limit: publicProPackageLimit,
+						overEightyPercent: false,
+					}),
+					expect.objectContaining({
+						resource: 'email_receives_per_day',
+						limit: freeReceiveLimit,
+						overEightyPercent: true,
+					}),
+				]),
+			}),
+		]),
+	)
+
+	const freePackagePressure = {
+		kind: 'entitlement' as const,
+		resource: 'saved_packages',
+		label: 'saved packages',
+		current: packagesOverFree,
+		limit: freePackageLimit,
+		percentOfLimit: packagesOverFree / freePackageLimit,
+	}
+	const freeReceivePressure = {
+		kind: 'entitlement' as const,
+		resource: 'email_receives_per_day',
+		label: 'email receives / day',
+		current: receivesAtFreeCap,
+		limit: freeReceiveLimit,
+		percentOfLimit: receivesAtFreeCap / freeReceiveLimit,
+	}
+	expect(issues).toEqual(
+		expect.arrayContaining([
+			{
+				...freePackagePressure,
+				stableUserId: 'base-free',
+				username: 'freefolk',
+			},
+			{
+				...freePackagePressure,
+				stableUserId: 'expired-gift',
+				username: 'pastgift',
+			},
+			{
+				...freeReceivePressure,
+				stableUserId: 'gifted',
+				username: 'continuumpraxis',
+			},
+			{
+				...freeReceivePressure,
+				stableUserId: 'referral-gift',
+				username: 'referred',
+			},
+		]),
+	)
+	expect(issues).not.toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				stableUserId: 'gifted',
+				resource: 'saved_packages',
+			}),
+			expect.objectContaining({
+				stableUserId: 'referral-gift',
+				resource: 'saved_packages',
+			}),
+		]),
+	)
+	expect(
+		insights.entitlementPressure.map((row) => row.stableUserId).sort(),
+	).toEqual(['base-free', 'expired-gift', 'gifted', 'referral-gift'])
 })
