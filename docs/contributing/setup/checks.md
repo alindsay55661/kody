@@ -19,9 +19,15 @@ pushes. See the [setup index](./index.md) for the other setup pages.
 - `git push` runs the Husky `pre-push` hook. It executes `npm run test:push`
   (`CI=1` `test:node` + `test:workers`) when any updated ref changes a path that
   is not docs-only, or when the pushed paths cannot be listed. A docs-only range
-  skips the suites. Deleting a remote branch skips them. An update diffs the
-  remote tip against the local tip, so a later docs-only push does not retest
-  commits already on the remote. A new branch diffs against the merge base of
+  skips the suites. A push that changes `skills-lock.json` or any path under
+  `.agents/skills/` also runs `npm run skills-lock:check`. `skills-lock.json`
+  counts with docs for this hook: a push of only the lock, skill markdown, and
+  other docs skips `test:push`. A non-markdown file under `.agents/skills/` (a
+  script or a test) still runs `test:push`, as does any other source file. An
+  unreadable push path list runs the skills-lock check too. Deleting a remote
+  branch skips the suites and the skills-lock check. An update diffs the remote
+  tip against the local tip, so a later docs-only push does not retest commits
+  already on the remote. A new branch diffs against the merge base of
   `origin/HEAD`, `origin/main`, or `main` (never the branch being created).
   Those suites are the same Nx targets the CI Node / Workers jobs run, so a
   remote-cache hit is possible after a push that runs them. Bundled guides and
@@ -68,20 +74,20 @@ pushes. See the [setup index](./index.md) for the other setup pages.
   `deploy-guardrails:check`, `workflows:check`,
   `origin-production-exports:check`, `docs:check-temporal`,
   `docs:check-decisions`, `docs:check-no-packages-invoke`,
-  `docs:check-no-hosted-execute`, `mermaid:check`, `slop-ratchet:check`, `knip`,
-  `audit:prod`, `lockfile:check`, and `overrides:check` in parallel, reporting
-  every failure (sibling checks are not aborted on the first failure, including
-  when one of the docs or mermaid checks fails). `worker-startup-time:check`
-  runs after that parallel phase so the CPU budget measures the bundle, not
-  contention from e2e and Worker builds (#2475, #2759). The unit-test and
-  Playwright legs set `CI=1` so timeouts, worker limits, and Nx cache hashes
-  match the contended parallel layout used in GitHub Actions. CI runs the same
-  checks as parallel jobs (🧹 Static, 🧪 Node, ☁️ Workers, 🔌 MCP, 🎭 E2E,
-  aggregated by ✅ Validate). If `npm run validate` passes locally, CI will
-  pass. Trusted writers (Cloud Agent environments, and same-repo validate) set
-  `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and the write token so Nx uploads task
-  artifacts to `https://nx-cache.kody.codes`. Fork `pull_request` validate uses
-  the read token and can only GET (see
+  `docs:check-no-hosted-execute`, `docs:check-file-refs`, `skills-lock:check`,
+  `mermaid:check`, `slop-ratchet:check`, `knip`, `audit:prod`, `lockfile:check`,
+  and `overrides:check` in parallel, reporting every failure (sibling checks are
+  not aborted on the first failure, including when one of the docs or mermaid
+  checks fails). `worker-startup-time:check` runs after that parallel phase so
+  the CPU budget measures the bundle, not contention from e2e and Worker builds
+  (#2475, #2759). The unit-test and Playwright legs set `CI=1` so timeouts,
+  worker limits, and Nx cache hashes match the contended parallel layout used in
+  GitHub Actions. CI runs the same checks as parallel jobs (🧹 Static, 🧪 Node,
+  ☁️ Workers, 🔌 MCP, 🎭 E2E, aggregated by ✅ Validate). If `npm run validate`
+  passes locally, CI will pass. Trusted writers (Cloud Agent environments, and
+  same-repo validate) set `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and the write
+  token so Nx uploads task artifacts to `https://nx-cache.kody.codes`. Fork
+  `pull_request` validate uses the read token and can only GET (see
   [decision 0019](../decisions/0019-self-hosted-nx-remote-cache.md),
   [decision 0038](../decisions/0038-no-nx-cloud-read-write-cache-tokens.md),
   [decision 0040](../decisions/0040-same-repo-writers-may-put-nx-cache.md), and
@@ -99,6 +105,19 @@ pushes. See the [setup index](./index.md) for the other setup pages.
   `npm install` rewrites `package-lock.json` for that drift (including an
   optional peer). The check keeps a Cloud Agent environment install from leaving
   a dirty lockfile on a fresh checkout.
+- `npm run skills-lock:check` (`tools/check-skills-lock.ts`) fails when
+  `skills-lock.json` drifts from the committed skill folders it records.
+  `ship-pr` must stay a repo-owned local skill (so `skills update` does not
+  reinstall it from kentcdodds/kcd-skills) and its `computedHash` must match the
+  folder hash. Edit the skill and refresh `computedHash`, or the check fails.
+- `npm run docs:check-file-refs` (`tools/check-markdown-file-refs.ts`) fails
+  when markdown cites a repo file that is not in the tree. Inline code paths
+  under `packages/`, `docs/`, `tools/`, `e2e/`, `.agents/`, or `.github/` are
+  checked when their parent directory exists, and relative links are checked
+  always. Generated Wrangler configs (`wrangler-*.generated.json` and anything
+  under `.wrangler/`) and local `.env` files are ignored. A path the same line
+  names as absent is ignored. Example trees whose parent directory is not in the
+  repo are ignored.
 - `npm run overrides:check` fails when a root `package.json` override is not
   documented in [dependency overrides](../dependency-overrides.md), when that
   doc keeps a section for a removed override, or when `package.json` repeats a

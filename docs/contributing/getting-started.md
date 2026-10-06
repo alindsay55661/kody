@@ -139,9 +139,10 @@ npm run validate
 typecheck, unit tests, Playwright E2E, MCP E2E, backup/status/nx-cache/jobs/
 highlight/api/api-docs/runtime/platform dry-run builds, structure checks
 (including `docs:check-no-packages-invoke`, `docs:check-no-hosted-execute`,
-`slop-ratchet:check`, and `knip`), and the production dependency audit
-(`audit:prod`) in parallel, then `worker-startup-time:check`. CI runs the same
-checks as parallel jobs (node and workers unit suites on separate runners).
+`docs:check-file-refs`, `skills-lock:check`, `slop-ratchet:check`, and `knip`),
+and the production dependency audit (`audit:prod`) in parallel, then
+`worker-startup-time:check`. CI runs the same checks as parallel jobs (node and
+workers unit suites on separate runners).
 
 To seed a deterministic test login after migrations:
 
