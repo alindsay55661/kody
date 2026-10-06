@@ -511,20 +511,16 @@ test('local gateway fetch hops scoped secrets and preserves ambient body metadat
 		const request = new Request('https://api.example.com/post', {
 			method: 'POST',
 			body: 'payload',
+			cache: 'no-store',
 		})
 		await __kodyGatewayFetch(request)
 		expect(ambientCalls).toHaveLength(1)
-		expect(typeof ambientCalls[0]?.input).toBe('string')
-		expect(
-			new TextDecoder().decode(
-				(ambientCalls[0]?.init as RequestInit).body as Uint8Array,
-			),
-		).toBe('payload')
-		expect(
-			(ambientCalls[0]?.init as RequestInit).headers as Record<string, string>,
-		).toMatchObject({
-			'content-type': 'text/plain;charset=UTF-8',
-		})
+		expect(ambientCalls[0]?.input).toBeInstanceOf(Request)
+		const forwarded = ambientCalls[0]?.input as Request
+		expect(forwarded.url).toBe('https://api.example.com/post')
+		expect(forwarded.method).toBe('POST')
+		expect(forwarded.cache).toBe('no-store')
+		expect(await forwarded.text()).toBe('payload')
 
 		ambientCalls.length = 0
 		gatewayCalls.length = 0
@@ -603,6 +599,101 @@ test('local gateway fetch hops scoped secrets and preserves ambient body metadat
 		).rejects.toThrow(/FormData bodies with secret placeholders/)
 	} finally {
 		globalThis.fetch = originalFetch
+	}
+})
+
+test('local isolate wraps globalThis.fetch so frozen copies still hop secrets', async () => {
+	const shim = createLocalExecuteRuntimeShimSource(runtimeModulePath)
+	expect(shim).toContain('kody.localExecuteFetchPatched')
+	expect(shim).toContain(
+		'globalThis.fetch = (input, init) => __kodyGatewayFetch(input, init)',
+	)
+	const callStart = shim.indexOf('async function __kodyGatewayFetchCall')
+	const callEnd = shim.indexOf(
+		'export function __kodyCreatePackageBoundStorage',
+	)
+	expect(callStart).toBeGreaterThan(-1)
+	expect(callEnd).toBeGreaterThan(callStart)
+	const callSource = shim.slice(callStart, callEnd)
+	expect(callSource).toContain('__kodyNativeFetch')
+	expect(callSource).not.toContain('globalThis.fetch')
+
+	const start = shim.indexOf('const __kodyNullBodyStatuses')
+	const end = shim.indexOf('export function __kodyCreatePackageBoundSecrets')
+	expect(start).toBeGreaterThan(-1)
+	expect(end).toBeGreaterThan(start)
+	const helpersSource = shim.slice(start, end).replaceAll(/^export /gm, '')
+	const ambientCalls: Array<{ input: unknown; init: unknown }> = []
+	const gatewayCalls: Array<unknown> = []
+	const kody = {
+		gatewayFetch: async (args: unknown) => {
+			gatewayCalls.push(args)
+			return {
+				status: 200,
+				statusText: 'OK',
+				headers: {},
+				bodyBase64: btoa('gw'),
+			}
+		},
+	}
+	const patchedSymbol = Symbol.for('kody.localExecuteFetchPatched')
+	const originalFetch = globalThis.fetch
+	const originalPatched = Reflect.get(globalThis, patchedSymbol)
+	globalThis.fetch = (async (input: unknown, init?: unknown) => {
+		ambientCalls.push({ input, init })
+		return new Response('ambient')
+	}) as typeof fetch
+	Reflect.deleteProperty(globalThis, patchedSymbol)
+	try {
+		new Function('kody', `${helpersSource}; return null;`)(kody)
+		expect(Reflect.get(globalThis, patchedSymbol)).toBe(true)
+
+		const frozenAlias = globalThis.fetch
+		await frozenAlias('https://discord.com/api/v10/channels/1/messages/2', {
+			method: 'PATCH',
+			headers: {
+				authorization: 'Bot {{secret:discordBotTokenKentPersonalAutomation}}',
+			},
+		})
+		expect(gatewayCalls).toHaveLength(1)
+		expect(ambientCalls).toHaveLength(0)
+		expect(gatewayCalls[0]).toMatchObject({
+			request: {
+				url: 'https://discord.com/api/v10/channels/1/messages/2',
+				headers: {
+					authorization: 'Bot {{secret:discordBotTokenKentPersonalAutomation}}',
+				},
+			},
+		})
+
+		gatewayCalls.length = 0
+		await globalThis.fetch('https://api.example.com/health')
+		expect(gatewayCalls).toHaveLength(0)
+		expect(ambientCalls).toHaveLength(1)
+		expect(ambientCalls[0]?.input).toBe('https://api.example.com/health')
+
+		ambientCalls.length = 0
+		await globalThis.fetch(
+			new Request('https://api.example.com/post', {
+				method: 'POST',
+				body: 'payload',
+				cache: 'no-store',
+			}),
+		)
+		expect(gatewayCalls).toHaveLength(0)
+		expect(ambientCalls).toHaveLength(1)
+		expect(ambientCalls[0]?.input).toBeInstanceOf(Request)
+		const forwarded = ambientCalls[0]?.input as Request
+		expect(forwarded.cache).toBe('no-store')
+		expect(forwarded.method).toBe('POST')
+		expect(await forwarded.text()).toBe('payload')
+	} finally {
+		globalThis.fetch = originalFetch
+		if (originalPatched === undefined) {
+			Reflect.deleteProperty(globalThis, patchedSymbol)
+		} else {
+			Reflect.set(globalThis, patchedSymbol, originalPatched)
+		}
 	}
 })
 
