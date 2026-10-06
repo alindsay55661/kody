@@ -16,20 +16,20 @@ validate gate count re-counted from `package.json` on 2026-10-06).
 | Duplicated lines (jscpd, min 70 tokens, non-test source) | 1.96% |
 | Runtime dependencies of the main worker package          | 28    |
 | Decision records in `docs/contributing/decisions/`       | 45    |
-| Checks in the `npm run validate` gate                    | 35    |
+| Checks in the `npm run validate` gate                    | 34    |
 
 ## Enforcement, not promises
 
-- `npm run validate` is the single authoritative gate: 34 concurrent lanes
+- `npm run validate` is the single authoritative gate: 33 concurrent lanes
   (`format:check`, `lint`, `typecheck`, `test:node`, `test:workers`,
   `test:e2e:run`, `test:mcp`, `backup:build`, `status:build`, `nx-cache:build`,
   `jobs:build`, `highlight:build`, `api:build`, `api-docs:build`,
   `runtime:build`, `platform:build`, `worker-startup-bundles:check`,
   `primitives:check`, `migrations:check`, `deploy-guardrails:check`,
   `workflows:check`, `origin-production-exports:check`, `docs:check-temporal`,
-  `docs:check-decisions`, `docs:check-no-packages-invoke`,
-  `docs:check-no-hosted-execute`, `docs:check-file-refs`, `skills-lock:check`,
-  `mermaid:check`, `slop-ratchet:check`, `knip`, `audit:prod`, `lockfile:check`,
+  `docs:check-decisions`, `docs:check-no-hosted-execute`,
+  `docs:check-file-refs`, `skills-lock:check`, `mermaid:check`,
+  `slop-ratchet:check`, `knip`, `audit:prod`, `lockfile:check`,
   `overrides:check`) plus `worker-startup-time:check` after that parallel phase.
 - `tools/file-size-ratchet.json` enforces budgets of 20 lines for root
   `AGENTS.md` (raise `agents-md` `maxLines` in
