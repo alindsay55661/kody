@@ -304,6 +304,8 @@ export function createFakeRunLog(
 			invocationId: string
 			claimUpdatedAt: string
 			runId: string | null
+			run: Record<string, unknown> | null
+			logs: Array<unknown>
 		}) {
 			const index = ledgerRows.findIndex(
 				(candidate) => candidate.id === input.invocationId,
@@ -318,7 +320,20 @@ export function createFakeRunLog(
 				ledgerRows.splice(index, 1)
 				released = true
 			}
-			if (input.runId) {
+			let runFinished = false
+			if (input.run) {
+				const runId = String(input.run['id'])
+				const previous = runRows.get(runId)
+				const previousStatus =
+					previous && typeof previous['status'] === 'string'
+						? String(previous['status'])
+						: null
+				if (previousStatus === 'running' || previousStatus == null) {
+					runRows.set(runId, clone(input.run))
+					runLogs.set(runId, input.logs.map(logMessage))
+					runFinished = true
+				}
+			} else if (input.runId) {
 				const run = runRows.get(input.runId)
 				if (run && run['status'] === 'running') {
 					runRows.delete(input.runId)
@@ -327,6 +342,7 @@ export function createFakeRunLog(
 			return {
 				released,
 				record: released || !row ? null : clone(row),
+				runFinished,
 			}
 		},
 		async getJobRunObservability(input: { jobId: string }) {
