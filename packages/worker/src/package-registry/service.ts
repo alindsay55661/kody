@@ -6,6 +6,7 @@ import { invalidateCommunityPublicCache } from '#app/data-cache.ts'
 import { getAppBaseUrl } from '#worker/app-base-url.ts'
 import {
 	deletePackageSlugRedirects,
+	listPackageSlugRedirects,
 	releasePackageSlugRedirect,
 	retirePackageSlug,
 } from '#worker/community/package-url.ts'
@@ -472,6 +473,11 @@ export async function refreshSavedPackageProjection(input: {
 			}
 			// Same-isolate invoke paths must observe this refresh immediately;
 			// other isolates converge within the freshness-cache TTL.
+			const retiredPackageAppSlugs = await listPackageSlugRedirects({
+				db: input.env.APP_DB,
+				userId: input.userId,
+				packageId: input.packageId,
+			})
 			invalidateInvokeContractFreshness({
 				userId: input.userId,
 				packageIdOrKodyIds: [
@@ -484,6 +490,15 @@ export async function refreshSavedPackageProjection(input: {
 					...(existing && existing.name !== savedPackage.name
 						? [`kody:${existing.name}`]
 						: []),
+				],
+				// Package-app slug cache is keyed by name leaf, not package id /
+				// kody:@ refs. Include every retired redirect leaf (multi-hop
+				// renames) so a warm isolate cannot keep serving an older path
+				// after an intermediate slug is reclaimed.
+				packageAppSlugs: [
+					getPackageNameLeaf(savedPackage.name),
+					...(existing ? [getPackageNameLeaf(existing.name)] : []),
+					...retiredPackageAppSlugs,
 				],
 				sourceId: input.sourceId,
 			})
@@ -670,6 +685,16 @@ export async function deleteSavedPackageProjection(input: {
 				userId: input.userId,
 				packageId: input.packageId,
 			})
+			// Capture retired leaves before deleting redirect rows so the
+			// package-app slug cache can be cleared for every path that still
+			// pointed here (not only the current name leaf).
+			const retiredPackageAppSlugs = savedPackage
+				? await listPackageSlugRedirects({
+						db: input.env.APP_DB,
+						userId: input.userId,
+						packageId: input.packageId,
+					})
+				: []
 			// Retired slugs only mean something while the package they point at
 			// exists; leaving them behind would hand a later package another
 			// package's redirect history.
@@ -699,6 +724,10 @@ export async function deleteSavedPackageProjection(input: {
 					...(savedPackage
 						? [savedPackage.kodyId, `kody:${savedPackage.name}`]
 						: []),
+				],
+				packageAppSlugs: [
+					...(savedPackage ? [getPackageNameLeaf(savedPackage.name)] : []),
+					...retiredPackageAppSlugs,
 				],
 				sourceId: savedPackage?.sourceId ?? null,
 			})

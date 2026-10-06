@@ -8,13 +8,15 @@ import {
 	type PackageAppMount,
 } from '@kody-internal/shared/public-urls.ts'
 import { accountCreditsPath } from '#universal/compute-overage.ts'
+import { packageAppHandoffQueryParam } from '#app/package-app-handoff.ts'
 import { getAppBaseUrl } from '#worker/app-base-url.ts'
 import { isComputeOverageLimitError } from '#worker/entitlements/errors.ts'
 import { getUsernameFormatValidationError } from '#worker/identity/username.ts'
 import {
 	loadInvokeManifestBySourceId,
-	resolveSavedPackage,
+	resolveSavedPackageForPackageAppSlug,
 } from '#worker/package-invocations/module-artifacts.ts'
+import { getPackageNameLeaf } from '#worker/package-registry/package-name.ts'
 import { loadPackageSourceBySourceId } from '#worker/package-registry/source.ts'
 import {
 	buildPackageAppWorker,
@@ -459,21 +461,63 @@ export async function servePackageAppRequest(input: {
 			serverTiming,
 		)
 	}
-	// Same freshness-tier cache as keyless host export invoke: warm serve must
-	// not pay a D1 round trip for the saved-package or entity-source row.
-	const savedPackage = await pushServerTiming(
+	// Same freshness-tier cache family as keyless host export invoke, but a
+	// distinct key that may follow slug redirects. A retired slug never serves
+	// the app: permanent 308 to the current leaf so cookies/caches/storage stay
+	// on one canonical path (webhooks/invocations still follow internally).
+	const slugLookup = await pushServerTiming(
 		serverTiming,
 		'resolveSavedPackage',
 		() =>
-			resolveSavedPackage({
+			resolveSavedPackageForPackageAppSlug({
 				db: env.APP_DB,
 				userId: owner.userId,
-				packageIdOrKodyId: kodyId,
+				slug: kodyId,
 			}),
 	)
-	if (!savedPackage || !savedPackage.hasApp) {
+	if (!slugLookup || !slugLookup.savedPackage.hasApp) {
 		return attachPackageAppServerTiming(
 			new Response(buildPackageAppNotFoundMessage(), { status: 404 }),
+			serverTiming,
+		)
+	}
+	const savedPackage = slugLookup.savedPackage
+	if (slugLookup.retired) {
+		// Location must use the name leaf (Kent: slug = package name leaf), not
+		// savedPackage.kodyId — those can diverge until Phase 2's single writer,
+		// and a mismatch would 308 to the same retired path forever.
+		const currentSlug = getPackageNameLeaf(savedPackage.name)
+		const locationPath =
+			packagePath.mount === 'user-subdomain'
+				? buildPackageAppSubdomainPath({
+						kodyId: currentSlug,
+						restPath:
+							forwardedPackageRestPath === '/'
+								? null
+								: forwardedPackageRestPath,
+					})
+				: buildPackageAppPath({
+						username: packagePath.username,
+						kodyId: currentSlug,
+						restPath:
+							forwardedPackageRestPath === '/'
+								? null
+								: forwardedPackageRestPath,
+					})
+		const location = new URL(locationPath, requestUrl)
+		// Drop a handoff minted for the retired slug — consume would reject it.
+		location.search = requestUrl.search
+		location.searchParams.delete(packageAppHandoffQueryParam)
+		return attachPackageAppServerTiming(
+			new Response(null, {
+				status: 308,
+				headers: {
+					Location: `${location.pathname}${location.search}`,
+					// Source slug can be reclaimed by a later package; positive
+					// freshness would keep sending browsers to the wrong app.
+					'Cache-Control': 'no-store',
+				},
+			}),
 			serverTiming,
 		)
 	}
@@ -540,12 +584,15 @@ export async function servePackageAppRequest(input: {
 	if (assetRelativePath !== null) {
 		// Same mount rule as buildPackageAppPublicContext: the username lives in
 		// the hostname on a per-user subdomain and in the path when inline.
+		// URL path segment is the name leaf (Kent: slug = leaf), not kodyId —
+		// those can diverge until Phase 2's single writer.
+		const urlSlug = getPackageNameLeaf(savedPackage.name)
 		const appBasePath =
 			packagePath.mount === 'user-subdomain'
-				? buildPackageAppSubdomainPath({ kodyId: savedPackage.kodyId })
+				? buildPackageAppSubdomainPath({ kodyId: urlSlug })
 				: buildPackageAppPath({
 						username: packagePath.username,
-						kodyId: savedPackage.kodyId,
+						kodyId: urlSlug,
 					})
 		try {
 			const packageManifest = await pushServerTiming(
