@@ -2,18 +2,22 @@ import { bytesToBase64Url } from '@kody-internal/shared/base64.ts'
 import { sha256Hex } from '@kody-internal/shared/sha256.ts'
 import { timingSafeEqualString } from '@kody-internal/shared/timing-safe.ts'
 import { McpCallerError } from '#mcp/caller-error.ts'
+import { withAccountWriteLease } from '#worker/account/deletion-state.ts'
 import { isCredentialInvalidatedByStoredPasswordChange } from '#worker/password-change-lockout.ts'
+import { type UserMeterEnv } from '#worker/entitlements/user-meter-client.ts'
 import {
 	apiTokenScopeSatisfies,
 	normalizeApiTokenScopes,
 	type ApiTokenScope,
 } from './scopes.ts'
 import {
+	apiTokenLifetimeMissingError,
 	apiTokenPolicy,
-	cliBootstrapTokenLifetimePolicy,
 	mintApiToken,
+	resolveApiTokenLifetime,
 	type ApiTokenMintParent,
 	type ApiTokenSecretView,
+	type ResolvedApiTokenLifetime,
 } from './service.ts'
 
 /** Distinct from `kody_at_` so chat/logs can show the CLI command safely. */
@@ -34,14 +38,11 @@ export const cliCredentialBootstrapPolicy = {
 		'local-execute',
 		'account:read',
 	] as const satisfies ReadonlyArray<ApiTokenScope>,
-	defaultIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.defaultIdleTtlSeconds,
-	minIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.minIdleTtlSeconds,
-	maxIdleTtlSeconds: cliBootstrapTokenLifetimePolicy.maxIdleTtlSeconds,
-	defaultMaxLifetimeSeconds:
-		cliBootstrapTokenLifetimePolicy.defaultMaxLifetimeSeconds,
-	maxMaxLifetimeSeconds: cliBootstrapTokenLifetimePolicy.maxMaxLifetimeSeconds,
-	cliCommand: (code: string) =>
-		`npx @kodycodes/cli auth bootstrap --code ${code}`,
+	minIdleTtlSeconds: apiTokenPolicy.minIdleTtlSeconds,
+	maxIdleTtlSeconds: apiTokenPolicy.maxIdleTtlSeconds,
+	maxMaxLifetimeSeconds: apiTokenPolicy.maxMaxLifetimeSeconds,
+	cliCommand: (code: string, lifetimeCliFlags: string) =>
+		`npx @kodycodes/cli auth bootstrap --code ${code} ${lifetimeCliFlags}`,
 } as const
 
 const bootstrapCodePattern = /^kody_bc_([a-z0-9]{16})_([A-Za-z0-9_-]{32})$/
@@ -107,20 +108,22 @@ function readTokenName(name: string) {
 	return trimmed
 }
 
-function readIntegerOption(input: {
-	value: number | undefined
-	fallback: number
+function readRequiredInteger(input: {
+	value: number
 	min: number
 	max: number
 	field: string
 }) {
-	const value = input.value ?? input.fallback
-	if (!Number.isInteger(value) || value < input.min || value > input.max) {
+	if (
+		!Number.isInteger(input.value) ||
+		input.value < input.min ||
+		input.value > input.max
+	) {
 		throw new McpCallerError(
 			`${input.field} must be an integer between ${input.min} and ${input.max}.`,
 		)
 	}
-	return value
+	return input.value
 }
 
 async function countOutstandingBootstrapCodes(input: {
@@ -166,6 +169,33 @@ async function pruneExpiredBootstrapCodes(input: {
 		.catch(() => undefined)
 }
 
+function resolveBootstrapLifetime(input: {
+	lifetime?: string | null
+	idleTtlSeconds?: number
+	maxLifetimeSeconds?: number
+	parentRemainingSeconds: number | null
+}): ResolvedApiTokenLifetime {
+	const resolved = resolveApiTokenLifetime({
+		lifetime: input.lifetime,
+		idleTtlSeconds: input.idleTtlSeconds,
+		maxLifetimeSeconds: input.maxLifetimeSeconds,
+		missingError: apiTokenLifetimeMissingError('api'),
+	})
+	if (input.parentRemainingSeconds === null) return resolved
+	if (input.parentRemainingSeconds < resolved.idleTtlSeconds) {
+		throw new McpCallerError(
+			'The calling API token expires too soon to mint a CLI bootstrap code.',
+		)
+	}
+	return {
+		...resolved,
+		maxLifetimeSeconds: Math.min(
+			resolved.maxLifetimeSeconds,
+			input.parentRemainingSeconds,
+		),
+	}
+}
+
 /**
  * Mint a one-shot bootstrap code for the CLI. Does **not** return a
  * `kody_at_` — the CLI redeems the code over HTTPS.
@@ -175,6 +205,7 @@ export async function mintCliCredentialBootstrap(input: {
 	userId: string
 	name?: string
 	scopes?: ReadonlyArray<unknown>
+	lifetime?: string | null
 	idleTtlSeconds?: number
 	maxLifetimeSeconds?: number
 	redeemTtlSeconds?: number
@@ -222,57 +253,16 @@ export async function mintCliCredentialBootstrap(input: {
 		)
 	}
 
-	// Ordinary API-token parents max out at 7 days, below the 14-day bootstrap
-	// idle default. When the caller omits lifetimes, clamp defaults to the
-	// parent's remaining life so tokens:write callers still get a code.
-	// Explicit idle/max above the parent remaining still fail below.
-	const idleFallback =
-		parentRemainingSeconds === null
-			? cliCredentialBootstrapPolicy.defaultIdleTtlSeconds
-			: Math.min(
-					cliCredentialBootstrapPolicy.defaultIdleTtlSeconds,
-					parentRemainingSeconds,
-				)
-	const idleTtlSeconds = readIntegerOption({
-		value: input.idleTtlSeconds,
-		fallback: idleFallback,
-		min: cliCredentialBootstrapPolicy.minIdleTtlSeconds,
-		max: cliCredentialBootstrapPolicy.maxIdleTtlSeconds,
-		field: 'idle_ttl_seconds',
+	const lifetime = resolveBootstrapLifetime({
+		lifetime: input.lifetime,
+		idleTtlSeconds: input.idleTtlSeconds,
+		maxLifetimeSeconds: input.maxLifetimeSeconds,
+		parentRemainingSeconds,
 	})
-	const maxFallbackBase = Math.max(
-		cliCredentialBootstrapPolicy.defaultMaxLifetimeSeconds,
-		idleTtlSeconds,
-	)
-	const maxFallback =
-		parentRemainingSeconds === null
-			? maxFallbackBase
-			: Math.max(
-					idleTtlSeconds,
-					Math.min(maxFallbackBase, parentRemainingSeconds),
-				)
-	const maxLifetimeSeconds = readIntegerOption({
-		value: input.maxLifetimeSeconds,
-		fallback: maxFallback,
-		min: idleTtlSeconds,
-		max: cliCredentialBootstrapPolicy.maxMaxLifetimeSeconds,
-		field: 'max_lifetime_seconds',
-	})
-	let effectiveMaxLifetimeSeconds = maxLifetimeSeconds
-	if (parentRemainingSeconds !== null) {
-		if (parentRemainingSeconds < idleTtlSeconds) {
-			throw new McpCallerError(
-				'The calling API token expires too soon to mint a CLI bootstrap code.',
-			)
-		}
-		effectiveMaxLifetimeSeconds = Math.min(
-			effectiveMaxLifetimeSeconds,
-			parentRemainingSeconds,
-		)
-	}
-	const redeemTtlSeconds = readIntegerOption({
-		value: input.redeemTtlSeconds,
-		fallback: cliCredentialBootstrapPolicy.defaultRedeemTtlSeconds,
+	const redeemTtlSeconds = readRequiredInteger({
+		value:
+			input.redeemTtlSeconds ??
+			cliCredentialBootstrapPolicy.defaultRedeemTtlSeconds,
 		min: cliCredentialBootstrapPolicy.minRedeemTtlSeconds,
 		max: cliCredentialBootstrapPolicy.maxRedeemTtlSeconds,
 		field: 'redeem_ttl_seconds',
@@ -316,8 +306,8 @@ export async function mintCliCredentialBootstrap(input: {
 			codeHash,
 			name,
 			JSON.stringify(scopes),
-			idleTtlSeconds,
-			effectiveMaxLifetimeSeconds,
+			lifetime.idleTtlSeconds,
+			lifetime.maxLifetimeSeconds,
 			expiresAt,
 			nowIso,
 		)
@@ -326,21 +316,31 @@ export async function mintCliCredentialBootstrap(input: {
 	return {
 		bootstrap_code: bootstrapCode,
 		expires_at: expiresAt,
-		cli_command: cliCredentialBootstrapPolicy.cliCommand(bootstrapCode),
+		cli_command: cliCredentialBootstrapPolicy.cliCommand(
+			bootstrapCode,
+			lifetime.cliFlags,
+		),
 		name,
 		scopes,
-		idle_ttl_seconds: idleTtlSeconds,
-		max_lifetime_seconds: effectiveMaxLifetimeSeconds,
+		idle_ttl_seconds: lifetime.idleTtlSeconds,
+		max_lifetime_seconds: lifetime.maxLifetimeSeconds,
 	}
 }
 
 /**
  * Exchange a one-shot bootstrap code for a normal `kody_at_` API token.
- * Burns the code atomically before minting.
+ * Burns the code atomically before minting. Lifetime is chosen at redeem time
+ * but cannot exceed the idle/max authorized when the code was minted (parent
+ * clamps and the caller's choice at mint). Pass `env` on the HTTP path so
+ * reclaim+mint run under the account write lease.
  */
 export async function redeemCliCredentialBootstrap(input: {
 	db: D1Database
 	code: string
+	lifetime?: string | null
+	idleTtlSeconds?: number
+	maxLifetimeSeconds?: number
+	env?: UserMeterEnv
 	now?: Date
 }): Promise<{ token: ApiTokenSecretView; userId: string }> {
 	const now = input.now ?? new Date()
@@ -348,6 +348,12 @@ export async function redeemCliCredentialBootstrap(input: {
 	if (!parsed) {
 		throw new McpCallerError('Invalid CLI bootstrap code.')
 	}
+	const requested = resolveApiTokenLifetime({
+		lifetime: input.lifetime,
+		idleTtlSeconds: input.idleTtlSeconds,
+		maxLifetimeSeconds: input.maxLifetimeSeconds,
+		missingError: apiTokenLifetimeMissingError('cli'),
+	})
 	const codeHash = await hashBootstrapCode(input.code.trim())
 	const row = await input.db
 		.prepare(
@@ -379,62 +385,99 @@ export async function redeemCliCredentialBootstrap(input: {
 	if (Date.parse(row.expires_at) <= now.getTime()) {
 		throw new McpCallerError('CLI bootstrap code expired.')
 	}
-
-	const user = await input.db
-		.prepare(
-			`SELECT deleting_at, suspended_at, password_changed_at
-			 FROM users
-			 WHERE stable_user_id = ?`,
+	if (
+		requested.idleTtlSeconds > row.idle_ttl_seconds ||
+		requested.maxLifetimeSeconds > row.max_lifetime_seconds
+	) {
+		throw new McpCallerError(
+			`Redeem lifetime cannot exceed the bootstrap code's authorized idle_ttl_seconds (${row.idle_ttl_seconds}) and max_lifetime_seconds (${row.max_lifetime_seconds}). Call cliCredentialBootstrap again with a longer lifetime if needed.`,
 		)
-		.bind(row.user_id)
-		.first<{
-			deleting_at: string | null
-			suspended_at: string | null
-			password_changed_at: string | null
-		}>()
-	const invalidated =
-		!user ||
-		Boolean(user.deleting_at) ||
-		Boolean(user.suspended_at) ||
-		isCredentialInvalidatedByStoredPasswordChange({
-			issuedAtMs: Date.parse(row.created_at),
-			storedPasswordChangedAt: user.password_changed_at,
+	}
+	// Absolute expiry is anchored to code created_at + authorized max. Reject
+	// before burning when that window has already ended so a late redeem does
+	// not consume the code and hand back an already-expired token.
+	const authorizedMaxExpiresAtMs =
+		Date.parse(row.created_at) + row.max_lifetime_seconds * 1000
+	if (authorizedMaxExpiresAtMs <= now.getTime()) {
+		throw new McpCallerError(
+			`The bootstrap code's authorized token lifetime window has already ended. Call cliCredentialBootstrap again.`,
+		)
+	}
+
+	const burnAndMint = async () => {
+		const user = await input.db
+			.prepare(
+				`SELECT deleting_at, suspended_at, password_changed_at
+				 FROM users
+				 WHERE stable_user_id = ?`,
+			)
+			.bind(row.user_id)
+			.first<{
+				deleting_at: string | null
+				suspended_at: string | null
+				password_changed_at: string | null
+			}>()
+		const invalidated =
+			!user ||
+			Boolean(user.deleting_at) ||
+			Boolean(user.suspended_at) ||
+			isCredentialInvalidatedByStoredPasswordChange({
+				issuedAtMs: Date.parse(row.created_at),
+				storedPasswordChangedAt: user.password_changed_at,
+			})
+
+		const consumedAt = now.toISOString()
+		const burned = await input.db
+			.prepare(
+				`UPDATE cli_credential_bootstrap_codes
+				 SET consumed_at = ?
+				 WHERE id = ? AND consumed_at IS NULL AND expires_at > ?`,
+			)
+			.bind(consumedAt, row.id, consumedAt)
+			.run()
+		if ((burned.meta.changes ?? 0) !== 1) {
+			throw new McpCallerError('CLI bootstrap code was already redeemed.')
+		}
+		if (invalidated) {
+			throw new McpCallerError('Invalid CLI bootstrap code.')
+		}
+
+		let scopes: Array<ApiTokenScope>
+		try {
+			scopes = normalizeApiTokenScopes(
+				JSON.parse(row.scopes_json) as Array<unknown>,
+			)
+		} catch {
+			throw new McpCallerError('Stored bootstrap scopes are invalid.')
+		}
+
+		const token = await mintApiToken({
+			db: input.db,
+			userId: row.user_id,
+			name: row.name,
+			scopes,
+			idleTtlSeconds: requested.idleTtlSeconds,
+			maxLifetimeSeconds: requested.maxLifetimeSeconds,
+			createdVia: 'cli-bootstrap',
+			// Absolute expiry cannot restart past the window authorized when the
+			// code was minted (parent clamps live in stored max_lifetime_seconds).
+			parent: {
+				scopes,
+				maxExpiresAt: new Date(authorizedMaxExpiresAtMs).toISOString(),
+			},
+			now,
 		})
-
-	const consumedAt = now.toISOString()
-	const burned = await input.db
-		.prepare(
-			`UPDATE cli_credential_bootstrap_codes
-			 SET consumed_at = ?
-			 WHERE id = ? AND consumed_at IS NULL AND expires_at > ?`,
-		)
-		.bind(consumedAt, row.id, consumedAt)
-		.run()
-	if ((burned.meta.changes ?? 0) !== 1) {
-		throw new McpCallerError('CLI bootstrap code was already redeemed.')
-	}
-	if (invalidated) {
-		throw new McpCallerError('Invalid CLI bootstrap code.')
+		return { token, userId: row.user_id }
 	}
 
-	let scopes: Array<ApiTokenScope>
-	try {
-		scopes = normalizeApiTokenScopes(
-			JSON.parse(row.scopes_json) as Array<unknown>,
-		)
-	} catch {
-		throw new McpCallerError('Stored bootstrap scopes are invalid.')
+	if (input.env) {
+		return withAccountWriteLease({
+			db: input.db,
+			stableUserId: row.user_id,
+			holder: 'api:cliCredentialBootstrapRedeem',
+			env: input.env,
+			write: burnAndMint,
+		})
 	}
-
-	const token = await mintApiToken({
-		db: input.db,
-		userId: row.user_id,
-		name: row.name,
-		scopes,
-		idleTtlSeconds: row.idle_ttl_seconds,
-		maxLifetimeSeconds: row.max_lifetime_seconds,
-		createdVia: 'cli-bootstrap',
-		now,
-	})
-	return { token, userId: row.user_id }
+	return burnAndMint()
 }

@@ -25,12 +25,14 @@ import {
 	isCapabilityProxyOperation,
 	isCliCredentialBootstrapRedeemOperation,
 } from './invoke.ts'
+import { parseNativeInput } from './native-operation-helpers.ts'
 import { apiOperationUsesQueryInputs, matchApiRoute } from './operations.ts'
 import {
 	mergeApiParams,
 	readJsonBody,
 	readQueryParams,
 } from './request-params.ts'
+import { bootstrapRedeemInputSchema } from './token-operations.ts'
 
 export const openApiDocumentPath = '/openapi.json'
 
@@ -123,16 +125,20 @@ async function handleOperation(input: {
 			match,
 			inputSchema: resolved.inputSchema,
 		})
-		const code =
-			typeof params === 'object' &&
-			params !== null &&
-			'code' in params &&
-			typeof (params as { code: unknown }).code === 'string'
-				? (params as { code: string }).code
-				: ''
+		const redeemInput = parseNativeInput(bootstrapRedeemInputSchema, params)
 		const redeemed = await redeemCliCredentialBootstrap({
 			db: input.env.APP_DB,
-			code,
+			code: redeemInput.code,
+			env: input.env,
+			...(redeemInput.lifetime === undefined
+				? {}
+				: { lifetime: redeemInput.lifetime }),
+			...(redeemInput.idle_ttl_seconds === undefined
+				? {}
+				: { idleTtlSeconds: redeemInput.idle_ttl_seconds }),
+			...(redeemInput.max_lifetime_seconds === undefined
+				? {}
+				: { maxLifetimeSeconds: redeemInput.max_lifetime_seconds }),
 		})
 		input.waitUntil(
 			recordUsage(
