@@ -33,7 +33,7 @@ import {
 	writeGeneratedWranglerConfig,
 } from './resource-utils.ts'
 
-type Command = 'ensure' | 'cleanup'
+type Command = 'ensure' | 'cleanup' | 'reset-d1'
 
 export type PreviewResourceKind =
 	| 'worker'
@@ -94,9 +94,9 @@ function parseArgs(argv: Array<string>): {
 	options: CliOptions
 } {
 	const command = argv[0]
-	if (command !== 'ensure' && command !== 'cleanup') {
+	if (command !== 'ensure' && command !== 'cleanup' && command !== 'reset-d1') {
 		fail(
-			`Missing or invalid command. Usage: node tools/ci/preview-resources.ts <ensure|cleanup> --worker-name <name>`,
+			`Missing or invalid command. Usage: node tools/ci/preview-resources.ts <ensure|cleanup|reset-d1> --worker-name <name>`,
 		)
 	}
 
@@ -915,6 +915,52 @@ export async function cleanupPreviewResources(options: PreviewCleanupOptions) {
 	}
 }
 
+/**
+ * Delete only the per-PR app + audit D1 databases so the next preview ensure /
+ * migrations apply bootstraps a fresh ledger. Used when rename-aware
+ * `d1_migrations` rewrite cannot match (#2776). Never touches production, the
+ * shared `kody-preview-jobs` database, or `kody-branch-*` previews (docs and
+ * this guard are PR-only).
+ */
+export const resetPreviewD1WorkerNamePattern = /^kody-pr-\d+$/
+
+export async function resetPreviewD1Databases(options: {
+	workerName: string
+	dryRun: boolean
+	sleep?: (ms: number) => Promise<void>
+	maxAttempts?: number
+	deadlineMs?: number
+	now?: () => number
+}) {
+	if (!resetPreviewD1WorkerNamePattern.test(options.workerName)) {
+		throw new Error(
+			`Refusing to reset D1 databases for "${options.workerName}": reset-d1 is limited to kody-pr-<number> (not branch previews or production).`,
+		)
+	}
+	const { d1DatabaseName, auditD1DatabaseName } = buildPreviewResourceNames(
+		options.workerName,
+	)
+	const names = [auditD1DatabaseName, d1DatabaseName]
+	// Validate both names before deleting either so a truncation mismatch cannot
+	// remove audit-db and then fail on app-db.
+	for (const name of names) {
+		assertPreviewResourceName(name, 'd1')
+	}
+	for (const name of names) {
+		await deletePreviewD1Database({
+			name,
+			dryRun: options.dryRun,
+			sleep: options.sleep,
+			maxAttempts: options.maxAttempts,
+			deadlineMs: options.deadlineMs,
+			now: options.now,
+		})
+	}
+	console.error(
+		`Preview D1 reset for ${options.workerName}: deleted ${d1DatabaseName} and ${auditD1DatabaseName}. Re-run Deploy Preview Resources (or ensure + migrations apply + seed).`,
+	)
+}
+
 async function main() {
 	const { command, options } = parseArgs(process.argv.slice(2))
 
@@ -926,6 +972,11 @@ async function main() {
 
 	if (command === 'ensure') {
 		await ensurePreviewResources(options)
+		return
+	}
+
+	if (command === 'reset-d1') {
+		await resetPreviewD1Databases(options)
 		return
 	}
 
