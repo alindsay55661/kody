@@ -82,11 +82,21 @@ export function rewriteInlinedLocalExecuteBundleSource(input: {
 	const removableInitNames = readRemovableEsmInitNames(preambleSource).filter(
 		(name) => retained.includes(name),
 	)
-	const sharedRuntimeExportAliases = readRemovableSharedRuntimeExportAliases(
-		preambleSource,
-	).filter(
-		(alias) => retained.includes(alias.name) && !authorBindings.has(alias.name),
-	)
+	const sharedRuntimeExportAliases = (() => {
+		const sharedAliasByName = new Map<string, SharedRuntimeExportAlias>()
+		for (const alias of [
+			...readRemovableSharedRuntimeExportAliases(preambleSource),
+			...readRetainedSharedRuntimeExportAliases(retained, authorBindings),
+		]) {
+			if (!retained.includes(alias.name) || authorBindings.has(alias.name)) {
+				continue
+			}
+			if (!sharedAliasByName.has(alias.name)) {
+				sharedAliasByName.set(alias.name, alias)
+			}
+		}
+		return [...sharedAliasByName.values()]
+	})()
 	const relativeShim = createRelativeImportSpecifier(
 		normalizeWorkspaceModulePath(input.modulePath),
 		normalizeWorkspaceModulePath(input.primaryRuntimePath),
@@ -289,10 +299,11 @@ export function readPackageBoundBindings(
 
 /**
  * Renamed shared runtime exports declared in removable sections
- * (`packageContext6 = __kodyCreateRuntimeRecordExport("packageContext")`, or
- * a hoisted `var packageContext6` later assigned inside `__esm`). Retained
- * author modules keep those names; the replacement preamble must alias them
- * to the shim's canonical binding.
+ * (`packageContext6 = __kodyCreateRuntimeRecordExport("packageContext")`, a
+ * hoisted `var packageContext6` — including multi-declarator lists — or any
+ * other removable-text mention of the renamed binding). Retained author
+ * modules keep those names; the replacement preamble must alias them to the
+ * shim.
  */
 export function readRemovableSharedRuntimeExportAliases(
 	preambleSource: string,
@@ -323,17 +334,83 @@ export function readRemovableSharedRuntimeExportAliases(
 	}
 
 	for (const canonical of sharedRuntimeExportCanonicals) {
-		const declPattern = new RegExp(
-			`(?:var|let|const)\\s+(${canonical}\\d+)\\b`,
-			'g',
-		)
-		for (const match of preambleSource.matchAll(declPattern)) {
+		// Any mention in removable text, including multi-declarator lists
+		// (`var packageStorage6, packageContext6`), facade fields, and
+		// assignments left after inlining stripped the factory call.
+		const anyPattern = new RegExp(`\\b(${canonical}\\d+)\\b`, 'g')
+		for (const match of preambleSource.matchAll(anyPattern)) {
 			remember(canonical, match[1], match.index ?? 0)
 		}
 	}
 
 	aliases.sort((left, right) => left.index - right.index)
 	return aliases.map(({ canonical, name }) => ({ canonical, name }))
+}
+
+/**
+ * Retained author modules may still reference `packageContext6` after the
+ * removable sections that declared it are stripped, even when the removable
+ * text no longer contains that identifier (unusual inlining shapes). Collect
+ * numbered shared-export names from retained source that are not already
+ * top-level author bindings.
+ *
+ * Skip names that appear only as bare `typeof name` probes — those are
+ * intentional unbound checks and must keep returning `"undefined"` rather
+ * than gaining a shim binding.
+ */
+export function readRetainedSharedRuntimeExportAliases(
+	retainedSource: string,
+	authorBindings: ReadonlySet<string>,
+): Array<SharedRuntimeExportAlias> {
+	const aliases: Array<SharedRuntimeExportAlias & { index: number }> = []
+	const seen = new Set<string>()
+	for (const canonical of sharedRuntimeExportCanonicals) {
+		const pattern = new RegExp(`\\b(${canonical}\\d+)\\b`, 'g')
+		for (const match of retainedSource.matchAll(pattern)) {
+			const name = match[1]
+			const index = match.index ?? 0
+			if (!name || seen.has(name) || authorBindings.has(name)) continue
+			if (isOnlyBareTypeofProbe(retainedSource, name)) continue
+			seen.add(name)
+			aliases.push({ canonical, name, index })
+		}
+	}
+	aliases.sort((left, right) => left.index - right.index)
+	return aliases.map(({ canonical, name }) => ({ canonical, name }))
+}
+
+/**
+ * `typeof undeclared` is defined to return `"undefined"`. Binding that name
+ * to the shim would flip feature probes. `typeof name?.prop` still throws if
+ * `name` is undeclared, so those uses still need an alias.
+ */
+function isOnlyBareTypeofProbe(source: string, name: string) {
+	const pattern = new RegExp(`\\b${name}\\b`, 'g')
+	const matches = [...source.matchAll(pattern)]
+	if (matches.length === 0) return true
+	return matches.every((match) => {
+		const index = match.index ?? 0
+		if (!isPrecededByTypeof(source, index)) return false
+		const after = source.slice(index + name.length, index + name.length + 2)
+		// Bare probe: typeof name / typeof name === … — not typeof name?.x
+		return !/^[?.([]/.test(after)
+	})
+}
+
+/** True when `source[index]` is immediately after `typeof` plus whitespace. */
+function isPrecededByTypeof(source: string, index: number) {
+	let cursor = index
+	while (cursor > 0 && /\s/.test(source[cursor - 1] ?? '')) {
+		cursor -= 1
+	}
+	const keyword = 'typeof'
+	if (cursor < keyword.length) return false
+	if (source.slice(cursor - keyword.length, cursor) !== keyword) return false
+	const beforeKeyword = cursor - keyword.length - 1
+	if (beforeKeyword >= 0 && /[A-Za-z0-9_$]/.test(source[beforeKeyword] ?? '')) {
+		return false
+	}
+	return true
 }
 
 /**
