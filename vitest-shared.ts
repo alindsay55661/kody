@@ -60,8 +60,9 @@ export const sharedProjectConfig = {
 		testTimeout,
 		hookTimeout: testTimeout,
 		// `validate` runs this suite concurrently with Playwright and two
-		// Wrangler servers on 4-core CI runners; leave a core free so their
-		// startup is not starved by test workers.
+		// Wrangler servers on 4-core machines; leave a core free so their
+		// startup is not starved by test workers. Workers-unit may lower this
+		// further under `KODY_VALIDATE_LOAD` (see vitest.workers.config.ts).
 		maxWorkers: process.env.CI ? 3 : undefined,
 		clearMocks: true,
 		mockReset: true,
