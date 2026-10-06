@@ -1,3 +1,4 @@
+import { invalidatePackageAppOwnerCache } from '#app/package-app-owner.ts'
 import { isNonProductionRuntime } from '#app/deployment-env.ts'
 import { getUniqueConstraintField } from '#worker/database-errors.ts'
 import { sendCloudflareEmail } from '#app/email/cloudflare-email.ts'
@@ -216,6 +217,10 @@ export async function verifyEmailChangeToken(input: {
 		}
 		throw error
 	}
+
+	// Invalidate immediately after the email write so same-isolate package-app
+	// serve cannot keep the old email while later cleanup claims may fail.
+	invalidatePackageAppOwnerCache({ stableUserId })
 
 	await input.db
 		.prepare(`DELETE FROM pending_email_changes WHERE user_id = ?`)

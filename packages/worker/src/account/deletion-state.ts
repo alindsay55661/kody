@@ -6,6 +6,7 @@ import {
 	type UserMeterEnv,
 	type UserMeterRpc,
 } from '#worker/entitlements/user-meter-client.ts'
+import { invalidatePackageAppOwnerCache } from '#app/package-app-owner.ts'
 import { runWithTransientDurableObjectResetRetry } from '#worker/durable-object-reset-retry.ts'
 
 export class AccountDeletionInProgressError extends Error {
@@ -201,6 +202,9 @@ export async function markAccountDeleting(input: {
 	if (!stableUserId || !deletingAt) {
 		throw new Error('Account could not be marked for deletion.')
 	}
+	// Invalidate before the UserMeter RPC so same-isolate package-app serve
+	// cannot keep using the pre-fence cached row for the duration of that call.
+	invalidatePackageAppOwnerCache({ stableUserId })
 	try {
 		const env = requireUserMeterEnv(input.env)
 		const marked = await runUserMeterRpc({
@@ -223,6 +227,7 @@ export async function markAccountDeleting(input: {
 				)
 				.bind(now, input.dbUserId, now)
 				.run()
+			invalidatePackageAppOwnerCache({ stableUserId })
 		}
 		throw error
 	}
@@ -289,6 +294,7 @@ export async function abortAccountDeleting(input: {
 					: undefined,
 			),
 	})
+	invalidatePackageAppOwnerCache({ stableUserId })
 }
 
 /**

@@ -8,6 +8,7 @@ import {
 	logAuditEvent,
 } from '#worker/audit-log.ts'
 import { loadAccountProfileData } from '#app/account-profile-data.ts'
+import { invalidatePackageAppOwnerCache } from '#app/package-app-owner.ts'
 import { getAppBaseUrl } from '#worker/app-base-url.ts'
 import { readAuthenticatedAppUser } from '#app/authenticated-user.ts'
 import { getUniqueConstraintField } from '#worker/database-errors.ts'
@@ -177,6 +178,11 @@ export function createAccountProfileApiHandler(env: Env) {
 					throw error
 				}
 
+				// Invalidate immediately after the claim so same-isolate package-app
+				// serve sees the new username even if later package/community work
+				// fails; rollback below invalidates again after restoring.
+				invalidatePackageAppOwnerCache({ stableUserId: packageUserId })
+
 				const claimed = await db.findOne(usersTable, {
 					where: { id: user.userId },
 				})
@@ -201,6 +207,9 @@ export function createAccountProfileApiHandler(env: Env) {
 						await db.update(usersTable, user.userId, {
 							username: previousUsername,
 							updated_at: utcSqliteTimestamp(),
+						})
+						invalidatePackageAppOwnerCache({
+							stableUserId: packageUserId,
 						})
 					} catch (rollbackError) {
 						console.error(
