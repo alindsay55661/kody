@@ -31,18 +31,18 @@ function extractGeneratedSource(startMarker: string, endMarker: string) {
 }
 
 const kodyProxySource = extractGeneratedSource(
-	'function createKodyProxy(runtimeBridge, mcpServerNames) {',
+	'function createKodyProxy(runtimeBridge, mcpServerNamesOrLoader) {',
 	'\nfunction createRealtimeProxy',
 )
 
 function createKodyProxyForTest(
 	runtimeBridge: unknown,
-	mcpServerNames: Array<string> = [],
+	mcpServerNames: Array<string> | (() => Promise<Array<string>>) = [],
 ) {
 	return new Function(
 		'runtimeBridge',
-		'mcpServerNames',
-		`${kodyProxySource}; return createKodyProxy(runtimeBridge, mcpServerNames);`,
+		'mcpServerNamesOrLoader',
+		`${kodyProxySource}; return createKodyProxy(runtimeBridge, mcpServerNamesOrLoader);`,
 	)(runtimeBridge, mcpServerNames) as Record<string, unknown>
 }
 
@@ -208,6 +208,121 @@ test('package app kody.mcp supports calls, advertises connected servers, and ded
 	} finally {
 		delete (globalThis as unknown as Record<symbol, unknown>)[authoritySymbol]
 	}
+})
+
+test('package app kody.mcp loads server names lazily on first mcp touch', async () => {
+	let loadCount = 0
+	const runtimeBridge = {
+		callCapability: async () => ({ ok: true }),
+	}
+	const proxy = createKodyProxyForTest(runtimeBridge, async () => {
+		loadCount += 1
+		return ['home']
+	})
+
+	expect(loadCount).toBe(0)
+	await expect(
+		(
+			proxy.mcp as Record<
+				string,
+				{ set_pin: (args: unknown) => Promise<unknown> }
+			>
+		).home?.set_pin({ pin: '1' }),
+	).resolves.toEqual({ ok: true })
+	expect(loadCount).toBe(1)
+
+	await Promise.resolve()
+	await Promise.resolve()
+	expect(Reflect.ownKeys(proxy.mcp as object)).toEqual(['home'])
+	expect(loadCount).toBe(1)
+
+	const advertised = getViaOwnKeysThenGopd(proxy.mcp as object, 'home') as {
+		set_pin: (args: unknown) => Promise<unknown>
+	}
+	expect(advertised).toBeTypeOf('object')
+	await expect(advertised.set_pin({ pin: '2' })).resolves.toEqual({ ok: true })
+	expect(loadCount).toBe(1)
+})
+
+test('modulesReferenceKodyMcp detects authored kody.mcp access', async () => {
+	const { modulesReferenceKodyMcp } =
+		await import('./package-app-mcp-preload.ts')
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'export default { async fetch() { return new Response("ok") } }',
+		}),
+	).toBe(false)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody } from "kody:runtime"\nexport default { async fetch() { return kody.mcp.home.ping({}) } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody } from "kody:runtime"\nconst home = kody["mcp"].home\nexport default home',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody as api } from "kody:runtime"\nexport default { async fetch() { const { home } = api.mcp; return home } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody as api } from "../.__kody_virtual__/public-runtime.js"\nexport default { async fetch() { const { home } = api.mcp; return home } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody as api } from "../.__kody_virtual__/package-runtime/abc.js"\nexport default { async fetch() { return api.mcp.home.ping({}) } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody as api } from "kody:runtime"\nexport default { async fetch() { return new Response(api.metaGetCurrentUser ? "ok" : "no") } }',
+		}),
+	).toBe(false)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'import { kody as api } from "../.__kody_virtual__/public-runtime.js"\nexport default { async fetch() { return new Response("ok") } }',
+		}),
+	).toBe(false)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.cjs':
+				'const { kody: api } = require("../.__kody_virtual__/public-runtime.js")\nmodule.exports = { async fetch() { const { home } = api.mcp; return home } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'entry.js':
+				'export default { async fetch() { const { kody: api } = await import("../.__kody_virtual__/public-runtime.js"); return api.mcp.home.ping({}) } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'runtime.js':
+				'export { kody } from "../.__kody_virtual__/public-runtime.js"',
+			'entry.js':
+				'import { kody as api } from "./runtime.js"\nexport default { async fetch() { const { home } = api.mcp; return home } }',
+		}),
+	).toBe(true)
+	expect(
+		modulesReferenceKodyMcp({
+			'runtime.js':
+				'export { kody } from "../.__kody_virtual__/public-runtime.js"',
+			'entry.js':
+				'import { kody as api } from "./runtime.js"\nexport default { async fetch() { return new Response(api.metaGetCurrentUser ? "ok" : "no") } }',
+		}),
+	).toBe(false)
 })
 
 test('package app workflows proxy validates input and forwards to the runtime bridge', async () => {

@@ -68,7 +68,10 @@ caches come in two tiers with different correctness arguments (see
   bounds isolate memory.
 - **Registry source lists** — enabled MCP-server refs, per-user TTL **30 s**
   with eager invalidation on mutation, matching the existing MCP hub snapshot
-  bounds.
+  bounds. Package-app entrypoints preload that list only when authored modules
+  statically reference `kody.mcp`; hello-world and other non-MCP apps pass a
+  lazy loader so `listMcpServerNames` runs only if author code first touches
+  `kody.mcp`.
 - **Package-app owner row** — per-`stableUserId` user snapshot for
   `resolvePackageAppOwnerByStableUserId`, TTL **15 s** (same clock as invoke
   freshness). Each request still re-applies suspend, deletion-fence, and

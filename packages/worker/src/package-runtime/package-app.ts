@@ -100,6 +100,7 @@ import {
 	createNullPackagesInvokeRewriteHostSource,
 	modulesContainUnboundPackagesInvokeAccess,
 } from './unbound-runtime-helpers.ts'
+import { modulesReferenceKodyMcp } from './package-app-mcp-preload.ts'
 
 const packageAppEntrypointName = 'PackageAppWorker'
 const packageAppRuntimeBindingName = 'KODY_RUNTIME'
@@ -107,7 +108,11 @@ const packageAppRuntimeBindingName = 'KODY_RUNTIME'
 function createPackageAppWorkerSource(input: {
 	mainModule: string
 	rewriteNullPackagesInvoke: boolean
+	preloadMcpServerNames: boolean
 }) {
+	const mcpServerNamesExpr = input.preloadMcpServerNames
+		? 'await runtimeBridge.listMcpServerNames().catch(() => [])'
+		: '() => runtimeBridge.listMcpServerNames().catch(() => [])'
 	return `
 import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -179,7 +184,7 @@ function buildFacetClassExportName(rawFacetName) {
 		: \`App_\${sanitizedFacetName}_\${hashSuffix}\`;
 }
 
-function createKodyProxy(runtimeBridge, mcpServerNames) {
+function createKodyProxy(runtimeBridge, mcpServerNamesOrLoader) {
 	const isProxyLookupKey = (name) =>
 		typeof name !== 'string' || name === 'then';
 	const createOpenNamespaceProxy = (getValue) =>
@@ -206,27 +211,61 @@ function createKodyProxy(runtimeBridge, mcpServerNames) {
 	// Empty/missing names stay open (GOPD still returns getValue) so a
 	// listing failure does not hide Get. Only a non-empty list restricts
 	// has/GOPD. Tool namespaces stay fully open.
-	const knownServerNames = Array.isArray(mcpServerNames)
-		? [...new Set(mcpServerNames.filter((name) => typeof name === 'string' && name.length > 0))]
-		: [];
-	const restrictServerKeys = knownServerNames.length > 0;
+	//
+	// Entrypoints that statically reference kody.mcp preload names before
+	// author code runs (array argument). Hello-world / non-MCP apps pass a
+	// loader instead so listMcpServerNames runs only on first kody.mcp touch.
+	const mcpNamesState = { known: [], restrict: false };
+	let mcpNamesLoadPromise = null;
+	const applyMcpServerNames = (names) => {
+		mcpNamesState.known = [
+			...new Set(
+				(Array.isArray(names) ? names : []).filter(
+					(name) => typeof name === 'string' && name.length > 0,
+				),
+			),
+		];
+		mcpNamesState.restrict = mcpNamesState.known.length > 0;
+		return mcpNamesState.known;
+	};
+	const ensureMcpServerNames = () => {
+		if (mcpNamesLoadPromise) return mcpNamesLoadPromise;
+		if (Array.isArray(mcpServerNamesOrLoader)) {
+			applyMcpServerNames(mcpServerNamesOrLoader);
+			mcpNamesLoadPromise = Promise.resolve(mcpNamesState.known);
+			return mcpNamesLoadPromise;
+		}
+		const loader =
+			typeof mcpServerNamesOrLoader === 'function'
+				? mcpServerNamesOrLoader
+				: async () => [];
+		mcpNamesLoadPromise = Promise.resolve()
+			.then(() => loader())
+			.then((names) => applyMcpServerNames(names))
+			.catch(() => applyMcpServerNames([]));
+		return mcpNamesLoadPromise;
+	};
+	if (Array.isArray(mcpServerNamesOrLoader)) {
+		ensureMcpServerNames();
+	}
 	const createMcpServerNamespaceProxy = (getValue) =>
 		new Proxy({}, {
 			get(_target, name) {
 				if (isProxyLookupKey(name)) return undefined;
+				void ensureMcpServerNames();
 				return getValue(name);
 			},
 			has(_target, name) {
 				if (isProxyLookupKey(name)) return false;
-				if (!restrictServerKeys) return true;
-				return knownServerNames.includes(name);
+				if (!mcpNamesState.restrict) return true;
+				return mcpNamesState.known.includes(name);
 			},
 			ownKeys() {
-				return [...knownServerNames];
+				return [...mcpNamesState.known];
 			},
 			getOwnPropertyDescriptor(_target, name) {
 				if (isProxyLookupKey(name)) return undefined;
-				if (restrictServerKeys && !knownServerNames.includes(name)) {
+				if (mcpNamesState.restrict && !mcpNamesState.known.includes(name)) {
 					return undefined;
 				}
 				return {
@@ -264,10 +303,14 @@ function createKodyProxy(runtimeBridge, mcpServerNames) {
 			}),
 		),
 	);
+	const touchMcp = () => {
+		void ensureMcpServerNames();
+		return mcp;
+	};
 	return new Proxy({}, {
 		get(_target, property) {
 			if (typeof property !== 'string' || property === 'then') return undefined;
-			if (property === 'mcp') return mcp;
+			if (property === 'mcp') return touchMcp();
 			if (property.startsWith('mcp:')) {
 				throw new Error(
 					\`MCP server tool "\${property}" is not available as a flat kody function. Use kody.mcp[serverName].toolName(input) instead.\`,
@@ -291,7 +334,7 @@ function createKodyProxy(runtimeBridge, mcpServerNames) {
 				configurable: true,
 				enumerable: true,
 				writable: true,
-				value: mcp,
+				value: touchMcp(),
 			};
 		},
 	});
@@ -564,7 +607,7 @@ function createPackageAppEnv(env, userModule) {
 	return runtimeEnv;
 }
 
-function createRuntime(runtimeBridge, packageContext, mcpServerNames) {
+function createRuntime(runtimeBridge, packageContext, mcpServerNamesOrLoader) {
 	const packageId = packageContext?.packageId ?? '';
 	const packageSecrets =
 		packageId.length > 0
@@ -582,7 +625,7 @@ function createRuntime(runtimeBridge, packageContext, mcpServerNames) {
 					},
 				}
 	return {
-		kody: createKodyProxy(runtimeBridge, mcpServerNames),
+		kody: createKodyProxy(runtimeBridge, mcpServerNamesOrLoader),
 		storage: undefined,
 		__kodyPackageSecrets: (secretsPackageId) =>
 			createPackageSecretsProxy(runtimeBridge, secretsPackageId),
@@ -771,11 +814,10 @@ export class ${packageAppEntrypointName} extends WorkerEntrypoint {
 			},
 		});
 		const consoleCapture = createConsoleLogCapture();
-		const mcpServerNames = await runtimeBridge.listMcpServerNames().catch(() => []);
 		const runtime = createRuntime(
 			runtimeBridge,
 			this.env.__kodyPackageContext ?? null,
-			mcpServerNames,
+			${mcpServerNamesExpr},
 		);
 		try {
 			consoleCapture.install();
@@ -829,11 +871,10 @@ export class ${packageAppEntrypointName} extends WorkerEntrypoint {
 			},
 		});
 		const consoleCapture = createConsoleLogCapture();
-		const mcpServerNames = await runtimeBridge.listMcpServerNames().catch(() => []);
 		const runtime = createRuntime(
 			runtimeBridge,
 			this.env.__kodyPackageContext ?? null,
-			mcpServerNames,
+			${mcpServerNamesExpr},
 		);
 		try {
 			consoleCapture.install();
@@ -1878,6 +1919,7 @@ async function buildPackageAppWorkerOptionsUncached(input: {
 			mainModule: bundled.mainModule,
 			rewriteNullPackagesInvoke:
 				modulesContainUnboundPackagesInvokeAccess(hydratedModules),
+			preloadMcpServerNames: modulesReferenceKodyMcp(bundled.modules),
 		}),
 	}
 	return {
