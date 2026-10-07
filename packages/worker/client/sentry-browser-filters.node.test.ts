@@ -82,6 +82,17 @@ const spoofFrames = [
 	{ function: '<anonymous>' },
 	{ function: 'spoofBrowserAndPlatform' },
 ]
+const replayCrossOriginElementMessage = `Failed to read a named property 'Element' from 'Window': Blocked a frame with origin "https://kody.codes" from accessing a cross-origin frame.`
+const replayCrossOriginPrototypeMessage =
+	"Cannot read properties of undefined (reading 'prototype')"
+const replayOnIframeLoadFrame = fr(
+	'sn.onIframeLoad',
+	'@sentry/replay/build/npm/esm/index.js',
+)
+const replayObserveAttachShadowFrame = fr(
+	'observeAttachShadow',
+	'@sentry/replay/build/npm/esm/index.js',
+)
 
 test('individual browser Sentry filters drop AbortError, Firefox Xray, and injected-global noise', () => {
 	const cases: Array<[typeof filterBrowserSentryEvent, Case, boolean]> = [
@@ -372,6 +383,31 @@ test('filterBrowserSentryEvent drops third-party and platform noise and keeps re
 		// CrabApple navigator.userAgent hard-spoof noise (KODY-80).
 		['Error', crabAppleMessage, spoofFrames],
 		['Error', 'something else', undefined, new Error(crabAppleMessage)],
+		// Sentry Replay cross-origin iframe Element read (KODY-8W / #23795).
+		[
+			'SecurityError',
+			replayCrossOriginElementMessage,
+			[replayOnIframeLoadFrame],
+		],
+		[
+			'DOMException',
+			`SecurityError: ${replayCrossOriginElementMessage}`,
+			[replayObserveAttachShadowFrame],
+		],
+		[
+			'TypeError',
+			replayCrossOriginPrototypeMessage,
+			[replayObserveAttachShadowFrame],
+		],
+		[
+			'SecurityError',
+			'something else',
+			undefined,
+			withStack(
+				new DOMException(replayCrossOriginElementMessage, 'SecurityError'),
+				`SecurityError: ${replayCrossOriginElementMessage}\n    at sn.onIframeLoad (@sentry/replay/index.js:2118:35)`,
+			),
+		],
 	]
 	expect(
 		dropped.filter((c) => !droppedBy(filterBrowserSentryEvent, c)),
@@ -476,6 +512,34 @@ test('filterBrowserSentryEvent drops third-party and platform noise and keeps re
 			'TypeError: Cannot redefine property: userAgent',
 			spoofFrames,
 		],
+		// Replay Element SecurityError without onIframeLoad / observeAttachShadow
+		// frames stays visible (could be app cross-origin access).
+		['SecurityError', replayCrossOriginElementMessage, [kodyEntry]],
+		[
+			'TypeError',
+			replayCrossOriginPrototypeMessage,
+			[fr('boot', 'https://kody.codes/assets/entry.js')],
+		],
+		[
+			'SecurityError',
+			"Failed to read a named property 'location' from 'Window': Blocked a frame with origin \"https://kody.codes\" from accessing a cross-origin frame.",
+			[replayOnIframeLoadFrame],
+		],
+		// Mismatched type + matching Element wording must stay visible
+		// (Devin review on #3006): TypeError must not inherit the
+		// SecurityError/DOMException Element drop path.
+		['TypeError', replayCrossOriginElementMessage, [replayOnIframeLoadFrame]],
+		// Stack URL substring must not count as a Replay iframe frame
+		// (CodeRabbit on #3006): `onIframeLoad-helper.js` ≠ onIframeLoad.
+		[
+			'SecurityError',
+			'something else',
+			undefined,
+			withStack(
+				new DOMException(replayCrossOriginElementMessage, 'SecurityError'),
+				`SecurityError: ${replayCrossOriginElementMessage}\n    at boot (https://kody.codes/assets/onIframeLoad-helper.js:1:1)`,
+			),
+		],
 	]
 	expect(kept.filter((c) => !keptBy(filterBrowserSentryEvent, c))).toEqual([])
 
@@ -490,4 +554,26 @@ test('filterBrowserSentryEvent drops third-party and platform noise and keeps re
 		},
 	}
 	expect(filterBrowserSentryEvent(crossValueEvent)).toBe(crossValueEvent)
+
+	// Replay Element wording on one value + onIframeLoad frames only on
+	// another value must not drop (same-entry type/message/frame gate).
+	const replayCrossValueEvent = {
+		exception: {
+			values: [
+				{
+					type: 'SecurityError',
+					value: replayCrossOriginElementMessage,
+					stacktrace: { frames: [kodyEntry] },
+				},
+				{
+					type: 'TypeError',
+					value: 'unrelated',
+					stacktrace: { frames: [replayOnIframeLoadFrame] },
+				},
+			],
+		},
+	}
+	expect(filterBrowserSentryEvent(replayCrossValueEvent)).toBe(
+		replayCrossValueEvent,
+	)
 })

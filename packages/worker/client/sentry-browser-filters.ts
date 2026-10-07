@@ -1394,6 +1394,174 @@ function filterRemixReconcileRemovedComponentCommittedSentryEvent<
 }
 
 /**
+ * Sentry Session Replay / rrweb cross-origin iframe instrumentation noise
+ * (getsentry/sentry-javascript#23795 / KODY-8W, issue 7777463624).
+ * `ShadowDomManager.observeAttachShadow` reads `iframeWindow.Element`
+ * without a try/catch. For a cross-origin frame `contentWindow` is a truthy
+ * restricted proxy, so the read throws into the host page via Replay's
+ * iframe `load` listener (`onIframeLoad` → `observeAttachShadow`).
+ *
+ * Primary mitigation is `block: ['iframe']` in `replayIntegration` (see
+ * `sentry-init.ts`). This filter is the residual beforeSend gate for events
+ * that still escape (older clients, race before block applies, TypeError
+ * variant when `Element` is undefined). Match is intentionally narrow:
+ * SecurityError / DOMException "Failed to read a named property 'Element'"
+ * cross-origin wording, or TypeError reading `'prototype'` of undefined,
+ * AND a stack frame named `onIframeLoad` / `observeAttachShadow` /
+ * `patchAttachShadow`. Never blanket-drop SecurityError or prototype
+ * TypeErrors from app code.
+ */
+const sentryReplayCrossOriginIframeElementMessage =
+	/^(?:(?:SecurityError|DOMException):\s*)?Failed to read a named property ['"]Element['"] from ['"]Window['"]:\s*Blocked a frame with origin ["'][^"']+["'] from accessing a cross-origin frame\.?$/i
+
+const sentryReplayCrossOriginIframePrototypeMessage =
+	/^(?:TypeError:\s*)?Cannot read propert(?:y|ies) of undefined \(reading ['"]prototype['"]\)$/
+
+const sentryReplayIframeInstrumentationStackFunctions = [
+	'onIframeLoad',
+	'observeAttachShadow',
+	'patchAttachShadow',
+] as const
+
+function isSentryReplayCrossOriginIframeElementMessage(message: string) {
+	return sentryReplayCrossOriginIframeElementMessage.test(message.trim())
+}
+
+function isSentryReplayCrossOriginIframePrototypeMessage(message: string) {
+	return sentryReplayCrossOriginIframePrototypeMessage.test(message.trim())
+}
+
+function isSentryReplayIframeInstrumentationStackFunction(name: string) {
+	return sentryReplayIframeInstrumentationStackFunctions.some(
+		(token) => name === token || name.endsWith(`.${token}`),
+	)
+}
+
+/**
+ * Parse function names out of an `Error.stack` string (V8 `at name (url)` /
+ * SpiderMonkey `name@url`). Do not substring-match tokens against full stack
+ * text — a URL like `onIframeLoad-helper.js` must not count.
+ */
+function stackTextMentionsReplayIframeInstrumentation(stack: string) {
+	for (const line of stack.split('\n')) {
+		const trimmed = line.trim()
+		const v8 = /^at\s+([^\s(]+)/.exec(trimmed)
+		const spidermonkey = /^([^@\s]+)@/.exec(trimmed)
+		const name = v8?.[1] ?? spidermonkey?.[1]
+		if (name && isSentryReplayIframeInstrumentationStackFunction(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+function framesMentionReplayIframeInstrumentation(
+	frames: Array<SentryStackFrame> | undefined,
+) {
+	if (!frames || frames.length === 0) return false
+	return frames.some(
+		(frame) =>
+			typeof frame.function === 'string' &&
+			isSentryReplayIframeInstrumentationStackFunction(frame.function),
+	)
+}
+
+function isSentryReplayCrossOriginIframeElementType(type: string | undefined) {
+	return (
+		type === undefined || type === 'SecurityError' || type === 'DOMException'
+	)
+}
+
+function isSentryReplayCrossOriginIframePrototypeType(
+	type: string | undefined,
+) {
+	return type === undefined || type === 'TypeError'
+}
+
+function isSentryReplayCrossOriginIframeTypedMessage(
+	type: string | undefined,
+	message: string,
+) {
+	if (
+		isSentryReplayCrossOriginIframeElementType(type) &&
+		isSentryReplayCrossOriginIframeElementMessage(message)
+	) {
+		return true
+	}
+	return (
+		isSentryReplayCrossOriginIframePrototypeType(type) &&
+		isSentryReplayCrossOriginIframePrototypeMessage(message)
+	)
+}
+
+function isSentryReplayCrossOriginIframeError(error: unknown) {
+	if (typeof error === 'string') {
+		return (
+			isSentryReplayCrossOriginIframeElementMessage(error) ||
+			isSentryReplayCrossOriginIframePrototypeMessage(error)
+		)
+	}
+	if (typeof error !== 'object' || error === null) return false
+	const name =
+		'name' in error && typeof error.name === 'string' ? error.name : undefined
+	const message =
+		'message' in error && typeof error.message === 'string'
+			? error.message
+			: undefined
+	if (!message) return false
+	if (!isSentryReplayCrossOriginIframeTypedMessage(name, message)) return false
+	const stack =
+		'stack' in error && typeof error.stack === 'string' ? error.stack : null
+	return stack ? stackTextMentionsReplayIframeInstrumentation(stack) : false
+}
+
+/**
+ * Drop only when type + message agree on the same exception.values entry
+ * (or on originalException / bare event.message when values are absent) and
+ * that same entry's frames name Replay iframe instrumentation. Never pair a
+ * matching message from one value with an instrumentation frame from another.
+ */
+function isSentryReplayCrossOriginIframeSentryEvent(
+	event: SentryErrorEventLike,
+	originalException?: unknown,
+) {
+	if (isSentryReplayCrossOriginIframeError(originalException)) return true
+
+	const values = event.exception?.values ?? []
+	if (values.length > 0) {
+		return values.some((value) => {
+			if (typeof value.value !== 'string') return false
+			if (
+				!isSentryReplayCrossOriginIframeTypedMessage(value.type, value.value)
+			) {
+				return false
+			}
+			return framesMentionReplayIframeInstrumentation(value.stacktrace?.frames)
+		})
+	}
+
+	if (typeof event.message !== 'string') return false
+	if (
+		!isSentryReplayCrossOriginIframeElementMessage(event.message) &&
+		!isSentryReplayCrossOriginIframePrototypeMessage(event.message)
+	) {
+		return false
+	}
+	return sentryEventStackFrameFunctions(event).some(
+		isSentryReplayIframeInstrumentationStackFunction,
+	)
+}
+
+function filterSentryReplayCrossOriginIframeSentryEvent<
+	T extends SentryErrorEventLike,
+>(event: T, originalException?: unknown): T | null {
+	if (isSentryReplayCrossOriginIframeSentryEvent(event, originalException)) {
+		return null
+	}
+	return event
+}
+
+/**
  * Drop CrabApple's failed hard-spoof of `navigator.userAgent`. An injected
  * script labeled CrabApple redefines that property; modern Safari throws
  * `TypeError: Cannot redefine property: userAgent`, and the script wraps it
@@ -1589,6 +1757,12 @@ export function filterBrowserSentryEvent<T extends SentryErrorEventLike>(
 	}
 	if (
 		filterCrabAppleUserAgentSpoofSentryEvent(event, originalException) === null
+	) {
+		return null
+	}
+	if (
+		filterSentryReplayCrossOriginIframeSentryEvent(event, originalException) ===
+		null
 	) {
 		return null
 	}
