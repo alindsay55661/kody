@@ -286,6 +286,7 @@ const registryKeys = [
 	'execute-invoke',
 	'connection-profiles',
 	'mcp-skills-extension',
+	'mcp-events-extension',
 ] as const
 
 function everyFlag<T>(value: T, overrides: Partial<Record<FlagKey, T>> = {}) {
@@ -556,7 +557,7 @@ test('listFeatureFlagsForAdmin includes registry flags and stale DB-only keys', 
 	})
 
 	const listed = await listFeatureFlagsForAdmin(db)
-	expect(listed).toHaveLength(8)
+	expect(listed).toHaveLength(9)
 	const byKey = (key: string) => listed.find((flag) => flag.key === key)
 	const executeMetric = {
 		eventType: 'execute',

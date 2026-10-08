@@ -24,6 +24,7 @@ import {
 	type OAuthGrantListHelpers,
 } from '#worker/oauth-grants.ts'
 import { buildMcpServerUrl } from '#worker/onboarding-prompts.ts'
+import { deleteMcpEventSubscriptionsForOauthClient } from '#mcp/events/subscriptions-repo.ts'
 import { parseAccountConnectionsPathname } from '#universal/account-connections.ts'
 import { type AccountConnectedAgentsLoaderData } from '#universal/loader-data.ts'
 import { type routes } from '#universal/routes.ts'
@@ -197,11 +198,23 @@ export function createAccountConnectedAgentsApiHandler(env: Env) {
 				env,
 			})
 			if ('error' in revoked) {
+				// Retry cleanup when grants are already gone but subscription
+				// rows may have survived a prior partial revoke.
+				await deleteMcpEventSubscriptionsForOauthClient({
+					db: env.APP_DB,
+					oauthClientId: parsed.value.clientId.trim(),
+					userId: user.mcpUser.userId,
+				})
 				return jsonResponse(
 					{ ok: false, error: 'Connected agent not found.' },
 					404,
 				)
 			}
+			await deleteMcpEventSubscriptionsForOauthClient({
+				db: env.APP_DB,
+				oauthClientId: parsed.value.clientId.trim(),
+				userId: user.mcpUser.userId,
+			})
 
 			void logAuditEvent({
 				db: auditDatabaseFromEnv(env),

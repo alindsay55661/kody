@@ -168,6 +168,24 @@ experiment members with
 `adminFeatureFlagSet({ key: "mcp-skills-extension", enabled: true, audience: "experiments_opt_in" })`.
 Remove the flag and gate sites when the experiment ends.
 
+`mcp-events-extension` is an experiment (default **off**, registry
+`defaultAudience: experiments_opt_in`) for the draft MCP Events extension
+(webhook delivery only; see
+[ADR 0059](../decisions/0059-mcp-events-extension-behind-flag.md)). When on for
+a caller whose stateless-lane request declares events support in its client
+capabilities, `server/discover` advertises `capabilities.events` and the server
+answers `events/list`, `events/subscribe`, and `events/unsubscribe`. Only
+`kody.emits` topics declared with `mcp: true` are listed. When off (or the
+client does not declare events), none of that is registered, and existing
+subscriptions stop receiving deliveries. Signed-in users can also turn it on
+from `/docs/mcp-events` (a per-user on override). The declared `successMetric`
+is `execute` event count, goal increase: event-driven clients follow deliveries
+with execute calls. Exposures use `exposureRecording: mcp-events-clients`
+(dedicated write from `registerMcpEvents` only), so execute and other non-events
+MCP callers stay out of the on/off cohorts. Enable for experiment members with
+`adminFeatureFlagSet({ key: "mcp-events-extension", enabled: true, audience: "experiments_opt_in" })`.
+Remove the flag and gate sites when the experiment ends.
+
 `package-share-grants` is a rollout kill switch for person-to-person package
 shares (invite, accept, UI, MCP, and runtime use). Registry default is **off**.
 Signed-in users can opt themselves in from `/docs/package-sharing` (a per-user

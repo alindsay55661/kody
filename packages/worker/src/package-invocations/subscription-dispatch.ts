@@ -3,6 +3,7 @@ import { listJsonSchemaSubsetValueErrors } from '@kody-internal/shared/json-sche
 import { toHex } from '@kody-internal/shared/hex.ts'
 import { runQueueableDynamicWorkerWork } from '#worker/dynamic-worker-evaluation-budget.ts'
 import { type createMcpCallerContext } from '#mcp/context.ts'
+import { fanOutPackageEventToMcpSubscriptions } from '#mcp/events/fan-out.ts'
 import {
 	type PackageEventDispatchInput,
 	type PackageEventTools,
@@ -189,13 +190,41 @@ export async function deliverPackageEventWithToolFactories(input: {
 	waitUntil?: (promise: Promise<unknown>) => void
 }): Promise<PackageEventDeliveryResult> {
 	const message = input.message
-	const subscriptions = await loadMatchingPackageEventSubscriptions({
-		env: input.env,
-		baseUrl: input.baseUrl,
-		userId: message.userId,
-		topic: message.topic,
-		payload: message.payload,
-	})
+	// MCP fan-out is independent of package-subscriber discovery: a broken
+	// package manifest must not hold webhook delivery hostage (queue retries
+	// and inline dispatch both reach this path).
+	const fanOutMcp = async () => {
+		try {
+			await fanOutPackageEventToMcpSubscriptions({
+				env: input.env,
+				baseUrl: input.baseUrl,
+				message,
+			})
+		} catch (error) {
+			console.error('mcp-events-fan-out-failed', {
+				topic: message.topic,
+				sourcePackageId: message.source.packageId,
+				error,
+			})
+		}
+	}
+
+	let subscriptions: Awaited<
+		ReturnType<typeof loadMatchingPackageEventSubscriptions>
+	>
+	try {
+		subscriptions = await loadMatchingPackageEventSubscriptions({
+			env: input.env,
+			baseUrl: input.baseUrl,
+			userId: message.userId,
+			topic: message.topic,
+			payload: message.payload,
+		})
+	} catch (discoveryError) {
+		await fanOutMcp()
+		throw discoveryError
+	}
+
 	const envelope = stripUntrustedSubscriptionEnvelopeFields({
 		event: message.topic,
 		source: {
@@ -257,6 +286,10 @@ export async function deliverPackageEventWithToolFactories(input: {
 			})
 		}
 	})
+	// Runs before the incomplete-dispatch throw so MCP subscribers are not
+	// held hostage by a package subscriber's infrastructure retry; a queue
+	// redelivery re-sends with the same eventId for receiver dedupe.
+	await fanOutMcp()
 	if (retryableInfrastructureErrors.length > 0) {
 		throw new Error('Package event dispatch was incomplete.', {
 			cause: retryableInfrastructureErrors[0],
@@ -353,6 +386,8 @@ export function createPackageEventToolsWithToolFactories(input: {
 					kodyId: packageContext.kodyId,
 				},
 				invokeDepth: packageInvokeDepth + 1,
+				...(declaredEvent.mcp ? { mcp: true as const } : {}),
+				emittedAt: new Date().toISOString(),
 			}
 			const queue = (input.env as Partial<Env>).PACKAGE_EVENTS_DISPATCH_QUEUE
 			let enqueued = false
