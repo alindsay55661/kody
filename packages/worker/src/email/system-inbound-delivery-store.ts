@@ -199,19 +199,25 @@ export async function chargeSystemInboundDeliveryOnce(input: {
 	now: Date
 }) {
 	await assertSystemDelivery(input.db, input.delivery)
-	const existing = await getSystemInboundDelivery({
-		db: input.db,
-		deliveryId: input.delivery.deliveryId,
-	})
-	if (existing) return { delivery: existing, overLimit: false as const }
 	const refusedWindow = await getSystemInboundDeliveryWindow({
 		db: input.db,
 		fingerprint: input.delivery.fingerprint,
 		now: input.now,
 	})
+	const existing = await getSystemInboundDelivery({
+		db: input.db,
+		deliveryId: input.delivery.deliveryId,
+	})
 	if (refusedWindow?.state === 'rejected') {
-		return { delivery: refusedWindow, overLimit: false as const }
+		// A rejected pointer blocks new charges and the deleted message's own
+		// delivery. An older charged row for the same fingerprint (window was
+		// reused then the newer copy deleted) may still resume.
+		const refusedOwnsThis = refusedWindow.messageId === input.delivery.messageId
+		if (refusedOwnsThis || !existing) {
+			return { delivery: refusedWindow, overLimit: false as const }
+		}
 	}
+	if (existing) return { delivery: existing, overLimit: false as const }
 	const pointerId = systemInboundDedupePointerId(input.delivery.fingerprint)
 	const operationToken = crypto.randomUUID()
 	const operationTimestamp = input.now.toISOString()
@@ -224,7 +230,15 @@ export async function chargeSystemInboundDeliveryOnce(input: {
 					.prepare(
 						`INSERT INTO system_email_daily_counters (
 					local_part, day, count, updated_at, operation_token
-				) VALUES (?, ?, 1, ?, ?)
+				)
+				SELECT ?, ?, 1, ?, ?
+				WHERE NOT EXISTS (
+					SELECT 1 FROM system_email_delivery_events WHERE id = ?
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM system_email_delivery_events
+					WHERE id = ? AND provider = ? AND state = 'rejected'
+				)
 				ON CONFLICT(local_part, day) DO UPDATE SET
 					count = count + 1, updated_at = excluded.updated_at,
 					operation_token = excluded.operation_token
@@ -242,6 +256,9 @@ export async function chargeSystemInboundDeliveryOnce(input: {
 						input.delivery.quotaDay,
 						operationTimestamp,
 						operationToken,
+						input.delivery.deliveryId,
+						pointerId,
+						systemInboundDedupeProvider,
 						input.limit,
 						input.delivery.deliveryId,
 						pointerId,
@@ -350,6 +367,11 @@ export async function claimSystemInboundDeliveryStorage(input: {
 							system_email_delivery_events.detail_json, '$.messageId'
 						)
 					))
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM system_email_delivery_events
+					WHERE id = ? AND provider = ? AND state = 'rejected'
+						AND json_extract(detail_json, '$.messageId') = ?
 				)`,
 			)
 			.bind(
@@ -364,6 +386,9 @@ export async function claimSystemInboundDeliveryStorage(input: {
 				storageLeaseAt,
 				input.delivery.deliveryId,
 				expiredBefore,
+				systemInboundDedupePointerId(input.delivery.fingerprint),
+				systemInboundDedupeProvider,
+				input.delivery.messageId,
 			),
 	})
 	const delivery = await getSystemInboundDelivery({

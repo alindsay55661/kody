@@ -16,7 +16,10 @@ import {
 	assertSystemEmailGraphAuthority,
 	commitSystemEmailAuthorityBatch,
 } from './system-email-authority.ts'
-import { systemInboundDedupeTombstoneStatements } from './system-inbound-dedupe.ts'
+import {
+	systemInboundDedupeTombstoneStatements,
+	systemInboundProvider,
+} from './system-inbound-dedupe.ts'
 
 export { systemEmailOwnerId }
 
@@ -420,9 +423,14 @@ async function deleteSystemEmailMessagesByIds(input: {
 				input.db
 					.prepare(
 						`DELETE FROM system_email_delivery_events
-						WHERE message_id IN (${placeholders})`,
+						WHERE message_id IN (${placeholders})
+							OR (
+								provider = '${systemInboundProvider}'
+								AND json_extract(detail_json, '$.messageId')
+									IN (${placeholders})
+							)`,
 					)
-					.bind(...deletableIds),
+					.bind(...deletableIds, ...deletableIds),
 				input.db
 					.prepare(
 						`DELETE FROM system_email_messages
