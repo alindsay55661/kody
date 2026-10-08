@@ -36,6 +36,8 @@ import { repoSessionRpc } from '#worker/repo/repo-session-rpc.ts'
 import { mcpClientHubDurableObjectName } from '#worker/user-scoped-durable-object-name.ts'
 import { packageRealtimeSessionRpc } from '#worker/package-runtime/realtime-session.ts'
 import { clearRunRecords } from '#worker/run-records/service.ts'
+import { cancelActiveWorkflowRunsForUser } from '#worker/package-runtime/package-workflows.ts'
+import { mcpOAuthRefreshFamilyUserKvPrefixes } from '#worker/oauth-refresh-family.ts'
 import {
 	userMeterNamespace,
 	userMeterRpc,
@@ -978,6 +980,25 @@ async function clearStorageRunners(input: {
 	return cleared
 }
 
+async function cancelActiveWorkflowRuns(input: {
+	env: Env
+	userId: string
+	warnings: Array<string>
+}): Promise<boolean> {
+	try {
+		await cancelActiveWorkflowRunsForUser({
+			env: input.env,
+			userId: input.userId,
+		})
+		return true
+	} catch (error) {
+		input.warnings.push(
+			`Workflow run cancellation failed: ${getErrorMessage(error)}`,
+		)
+		return false
+	}
+}
+
 async function clearRunLog(input: {
 	env: Env
 	userId: string
@@ -1560,6 +1581,19 @@ export async function deleteUserAccount(input: {
 		}
 	}
 
+	// Stop running package workflows before purging the storage their steps
+	// write to. On failure, stop with the deletion fence held and nothing
+	// purged: RunLog is the only index of the user's workflow instances, so a
+	// retry needs it to find and terminate them.
+	const workflowRunsCancelled = await cancelActiveWorkflowRuns({
+		env: input.env,
+		userId: input.mcpUserId,
+		warnings,
+	})
+	if (!workflowRunsCancelled) {
+		throw new AccountDeletionCleanupError(warnings, result)
+	}
+
 	result.deletedVectors = await deleteVectorsByIds({
 		env: input.env,
 		ids: inventory.vectorIds,
@@ -1648,6 +1682,8 @@ export async function deleteUserAccount(input: {
 				// deleted separately; purge the orphaned revert trees here rather
 				// than waiting on the 90-day TTL.
 				`package-codemod-revert:${input.mcpUserId}:`,
+				// Encrypted copies of the user's MCP OAuth tokens.
+				...mcpOAuthRefreshFamilyUserKvPrefixes(input.mcpUserId),
 			],
 			warnings,
 		})
@@ -1824,9 +1860,8 @@ export async function deleteUserAccount(input: {
 		throw new AccountDeletionCleanupError(warnings, result)
 	}
 
-	// The D1 user row is gone, so a later signup with the same email is a new
-	// account. Drop the UserMeter tombstone `purge()` restored; leaving it
-	// would fence every write (including `/mcp`) for that hashed stable id.
+	// The D1 user row is gone. Drop the UserMeter tombstone `purge()` restored
+	// so the purged object keeps no state for this stable id.
 	try {
 		await clearUserMeterDeletionTombstone({
 			env: input.env,

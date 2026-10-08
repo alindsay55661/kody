@@ -351,11 +351,17 @@ Both are opt-in and adapted from the Epic Stack.
   creation fan `user.created`. See
   [the admin events guide](../../guides/admin-events.md#user-created-and-deleted-admins).
 - On success, runs a full per-user cascade across:
+  - the user's active package workflow instances, terminated first so no step
+    writes after the purge; if any termination fails, deletion stops before
+    purging anything and keeps the account fenced so a retry can still find the
+    runs (finished instances stay in Cloudflare for their 30-day retention; see
+    `accountUserOwnedWorkflowSurfaces`),
   - all `user_id`-scoped D1 tables (children before parents),
   - the shared Vectorize capability index, removing memory, job and
     saved-package entries by id,
   - `BUNDLE_ARTIFACTS_KV` keys captured from `published_bundle_artifacts` and
-    `archived_job_artifacts`,
+    `archived_job_artifacts`, plus user-prefixed keys such as the encrypted MCP
+    OAuth refresh-family snapshots,
   - the user's `StorageRunner` Durable Objects via the user-scoped
     `storageRunnerRpc` stub,
   - all OAuth grants for the user (and the provider clients the user minted) via
@@ -385,10 +391,9 @@ Both are opt-in and adapted from the Epic Stack.
   `accountExportSection` served from the platform `MCP` Durable Object include
   grant metadata too.
 - After the user row is gone, origin clears the UserMeter deletion tombstone
-  `purge()` restored. `users.stable_user_id` is SHA-256 of the signup email, so
-  a later account with that email reuses the same Durable Object id and must not
-  inherit the previous deletion fence. Username reuse with a different email is
-  a different `stable_user_id` and does not share that object.
+  `purge()` restored so the purged object keeps no state. A later signup with
+  the same email or username gets a new random `stable_user_id`, so it never
+  shares the deleted account's Durable Objects, storage prefixes, or secrets.
 - Returns a structured
   `{ ok, deletedRowCounts, deletedKvKeys, revokedOAuthGrants, clearedDurableObjects, deletedVectors, warnings }`
   payload alongside a `Set-Cookie` that destroys the session.
@@ -785,9 +790,10 @@ intercepts `POST /oauth/token` refresh grants:
   exits.
 - Encrypted snapshots live in `BUNDLE_ARTIFACTS_KV` under
   `derived-cache:v1:mcp-oauth-refresh-family:` / `-replay:` with KV TTLs of two
-  hours and one hour. Retention is the TTL, so account deletion does not sweep
-  those keys. Snapshot writes are best-effort: a KV or encrypt failure does not
-  replace the provider's minted response.
+  hours and one hour. Account deletion prefix-deletes the user's keys; the TTL
+  covers any key written by a refresh that races deletion. Snapshot writes are
+  best-effort: a KV or encrypt failure does not replace the provider's minted
+  response.
 
 `/mcp` is protected by `packages/worker/src/mcp-auth.ts`:
 

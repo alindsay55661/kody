@@ -402,6 +402,10 @@ test('account deletion empties the user RunLog DO and leaves other users untouch
 					return {
 						listStorageIds: async () =>
 							(state?.runs ?? []).map((run) => run.storageId),
+						listWorkflowProjections: async () => ({
+							projections: [],
+							nextCursor: null,
+						}),
 						clearAll: async () => {
 							if (state) {
 								state.runs = []
@@ -451,4 +455,108 @@ test('account deletion purges a StorageRunner known only via user_storage_bucket
 	expect(idFromName).toHaveBeenCalledWith(
 		JSON.stringify([userId, 'exec:adhoc-only']),
 	)
+})
+
+function createRunningWorkflowDeletionEnv(input: {
+	events: Array<string>
+	terminate: (id: string) => Promise<void>
+}) {
+	const projections = new Map<string, Record<string, unknown>>([
+		[
+			'wf-running',
+			{
+				id: 'wf-running',
+				bindingName: 'DYNAMIC_CALLABLE_WORKFLOWS',
+				sourceType: 'inline',
+				workflowName: 'inline-code',
+				idempotencyKey: 'wf-running-key',
+				runAt: '2026-05-03T12:34:56.000Z',
+				status: 'running',
+				createdAt: '2026-05-03T12:34:56.000Z',
+				updatedAt: '2026-05-03T12:34:56.000Z',
+				completedAt: null,
+			},
+		],
+	])
+	const { db, rows } = createTestDb({ users: [userA] })
+	const env = createSuccessfulDeletionEnv(db, {
+		STORAGE_RUNNER: {
+			idFromName: (name: string) => name as unknown as DurableObjectId,
+			get: () => ({
+				clearStorage: async () => {
+					input.events.push('clearStorage')
+					return { ok: true as const }
+				},
+			}),
+		},
+		DYNAMIC_CALLABLE_WORKFLOWS: {
+			get: async (id: string) => ({
+				id,
+				status: async () => {
+					throw new Error('workflow status unavailable')
+				},
+				terminate: () => input.terminate(id),
+			}),
+		} as unknown as Workflow,
+		RUN_LOG: {
+			idFromName: (name: string) => name as unknown as DurableObjectId,
+			get: () => ({
+				listStorageIds: async () => ['storage-1'],
+				listWorkflowProjections: async (query: { status: string | null }) => ({
+					projections: [...projections.values()].filter(
+						(row) => row['status'] === query.status,
+					),
+					nextCursor: null,
+				}),
+				getWorkflowProjection: async (query: { id: string }) =>
+					projections.get(query.id) ?? null,
+				upsertWorkflowProjection: async (
+					projection: Record<string, unknown> & { id: string },
+				) => {
+					projections.set(projection.id, {
+						...projections.get(projection.id),
+						...projection,
+					})
+					return { ok: true as const }
+				},
+				clearAll: async () => {
+					input.events.push('clearAll')
+					projections.clear()
+					return { ok: true as const }
+				},
+			}),
+		},
+	})
+	return { env, rows }
+}
+
+test('account deletion terminates running package workflows before purging the run log', async () => {
+	const events: Array<string> = []
+	const { env } = createRunningWorkflowDeletionEnv({
+		events,
+		terminate: async (id) => {
+			events.push(`terminate:${id}`)
+		},
+	})
+	await deleteUserA(env)
+
+	expect(events).toEqual(['terminate:wf-running', 'clearStorage', 'clearAll'])
+})
+
+test('account deletion stops before purging anything when workflow termination fails', async () => {
+	const events: Array<string> = []
+	const { env, rows } = createRunningWorkflowDeletionEnv({
+		events,
+		terminate: async () => {
+			throw new Error('terminate unavailable')
+		},
+	})
+	await expect(deleteUserA(env)).rejects.toMatchObject({
+		name: 'AccountDeletionCleanupError',
+		cleanupErrors: [
+			expect.stringContaining('Workflow run cancellation failed'),
+		],
+	})
+	expect(events).toEqual([])
+	expect(rows.users).toEqual([fencedUser])
 })
