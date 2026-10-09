@@ -2,12 +2,14 @@ import {
 	AccountDeletionInProgressError,
 	withAccountWriteLease,
 } from '#worker/account/deletion-state.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 import { stripePlanRefreshDurableObjectName } from '#worker/user-scoped-durable-object-name.ts'
 
 export const stripePlanRefreshBackstopDelayMs = 60 * 60 * 1000
 
 export async function scheduleStripePlanRefreshBackstop(input: {
 	env: Env
+	/** Personal org id (= owner stable user id) or team org id. */
 	userId: string
 	now?: Date
 }) {
@@ -21,18 +23,37 @@ export async function scheduleStripePlanRefreshBackstop(input: {
 			stripePlanRefreshDurableObjectName(userId),
 		)
 		const stub = input.env.STRIPE_PLAN_REFRESH.get(id)
-		await withAccountWriteLease({
-			db: input.env.APP_DB,
-			stableUserId: userId,
-			holder: 'stripe_plan_refresh_schedule',
-			env: input.env,
-			write: async () => {
-				await stub.schedule({
-					userId,
-					refreshAt,
-				})
-			},
-		})
+		const schedule = async () => {
+			await stub.schedule({
+				userId,
+				refreshAt,
+			})
+		}
+		const livePersonalUser = await input.env.APP_DB.prepare(
+			`SELECT 1 AS ok FROM users WHERE stable_user_id = ?${andLiveDeletedAtSql()}`,
+		)
+			.bind(userId)
+			.first<{ ok: number }>()
+		if (livePersonalUser) {
+			await withAccountWriteLease({
+				db: input.env.APP_DB,
+				stableUserId: userId,
+				holder: 'stripe_plan_refresh_schedule',
+				env: input.env,
+				write: schedule,
+			})
+			return true
+		}
+		// Soft-deleted personal accounts have no live users row and must not
+		// re-arm alarms. Only a live team org (no personal identity) schedules
+		// without the account write lease.
+		const liveTeamOrg = await input.env.APP_DB.prepare(
+			`SELECT 1 AS ok FROM orgs WHERE id = ?${andLiveDeletedAtSql()}`,
+		)
+			.bind(userId)
+			.first<{ ok: number }>()
+		if (!liveTeamOrg) return false
+		await schedule()
 		return true
 	} catch (error) {
 		if (error instanceof AccountDeletionInProgressError) return false
