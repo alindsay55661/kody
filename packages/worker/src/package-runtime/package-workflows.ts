@@ -982,12 +982,48 @@ export async function createDynamicCallableWorkflow(input: {
 		}
 	}
 	const payload = await resolveWorkflowPayload(input)
-	const id = await createDynamicCallableWorkflowInstanceId(payload, {
-		// An explicit idempotency key must single-flight even before the
-		// RunLog projection row is written.
+	// An explicit idempotency key must single-flight even before the
+	// RunLog projection row is written. After a key release the deterministic
+	// engine id (and any later successors) stay occupied, so walk the
+	// `:after:<occupiedId>` chain until an unused id is free or a projection
+	// still holds the semantic key.
+	const maxSuccessorGenerations = 16
+	let id = await createDynamicCallableWorkflowInstanceId(payload, {
 		includeRunAt: !idempotencyKeyInput,
 	})
-	const existing = await getExistingWorkflowInstance(workflowBinding, id)
+	let existing = await getExistingWorkflowInstance(workflowBinding, id)
+	if (idempotencyKeyInput) {
+		for (
+			let generation = 0;
+			generation < maxSuccessorGenerations;
+			generation += 1
+		) {
+			const projectionForId = await getWorkflowProjection({
+				env,
+				userId: input.userId,
+				id,
+			})
+			if (projectionForId?.idempotencyKey === idempotencyKeyInput) {
+				break
+			}
+			if (!projectionForId && !existing) {
+				break
+			}
+			if (!projectionForId && existing) {
+				// Engine instance without a projection — reclaim below.
+				break
+			}
+			const occupiedId = existing?.id ?? projectionForId!.id
+			id = await createDynamicCallableWorkflowInstanceId(
+				{
+					...payload,
+					idempotencyKey: `${idempotencyKeyInput}:after:${occupiedId}`,
+				},
+				{ includeRunAt: false },
+			)
+			existing = await getExistingWorkflowInstance(workflowBinding, id)
+		}
+	}
 	if (existing) {
 		await projectWorkflowRun({
 			env,
