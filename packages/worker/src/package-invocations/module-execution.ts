@@ -17,11 +17,14 @@ import { resolveBackgroundMcpUser } from '#worker/identity/background-mcp-user.t
 import { isAccountSuspendedError } from '#worker/account/account-suspension.ts'
 import { consumeDailyEntitlement } from '#worker/entitlements/service.ts'
 import {
+	budgetLimitErrorCode,
 	computeOverageLimitErrorCode,
 	entitlementLimitErrorCode,
+	isBudgetLimitError,
 	isComputeOverageLimitError,
 	isEntitlementLimitError,
 } from '#worker/entitlements/errors.ts'
+import { getOrgById } from '#worker/orgs/repo.ts'
 import {
 	automationInvocationsPerDayResource,
 	shouldConsumeAutomationInvocationEntitlement,
@@ -171,17 +174,34 @@ export async function runSavedPackageModuleOnce(
 			// nothing. Failed attempts still count. Distinct from MCP
 			// execute_calls_per_day and scheduled job_runs_per_day.
 			try {
+				const orgRecord = await getOrgById(input.env.APP_DB, input.actor.orgId)
+				const orgSlug = orgRecord?.slug?.trim() || user.username?.trim() || null
+				const automationSource =
+					input.actor.request.kind === 'schedule'
+						? 'schedule'
+						: input.actor.request.kind === 'webhook'
+							? 'webhook'
+							: input.actor.request.kind === 'inbound-email'
+								? 'email'
+								: 'event'
 				await consumeDailyEntitlement({
 					db: input.env.APP_DB,
 					env: input.env,
 					userId: input.actor.orgId,
 					email: user.email,
 					resource: automationInvocationsPerDayResource,
+					orgBudget: {
+						orgId: input.actor.orgId,
+						orgSlug,
+						automationSource,
+						actorUserId: null,
+					},
 				})
 			} catch (error) {
 				if (
 					isEntitlementLimitError(error) ||
-					isComputeOverageLimitError(error)
+					isComputeOverageLimitError(error) ||
+					isBudgetLimitError(error)
 				) {
 					return {
 						kind: 'pre-execution-denied',
@@ -189,7 +209,9 @@ export async function runSavedPackageModuleOnce(
 							status: 429,
 							code: isEntitlementLimitError(error)
 								? entitlementLimitErrorCode
-								: computeOverageLimitErrorCode,
+								: isBudgetLimitError(error)
+									? budgetLimitErrorCode
+									: computeOverageLimitErrorCode,
 							message: error.message,
 							idempotencyKey: input.idempotencyKey ?? undefined,
 							details: error.details,

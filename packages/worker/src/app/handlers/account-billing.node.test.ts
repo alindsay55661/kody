@@ -1,4 +1,8 @@
-import { personIdFromStored } from '@kody-internal/shared/owner-person-ids.ts'
+import {
+	ownerIdFromStored,
+	personIdFromStored,
+} from '@kody-internal/shared/owner-person-ids.ts'
+import { deriveRequestContext } from '#worker/request-context/request-context.ts'
 import { expect, test, vi } from 'vitest'
 import type * as authenticatedUserModule from '#app/authenticated-user.ts'
 import { type AuthenticatedAppUser } from '#app/authenticated-user.ts'
@@ -230,6 +234,34 @@ test('billing checkout sells only Pro and selects monthly vs yearly Stripe price
 	expect(mockModule.createCheckoutSession).toHaveBeenCalledTimes(2)
 })
 
+test('billing checkout bills the request-bound org, not only the personal id', async () => {
+	mockModule.createCheckoutSession.mockResolvedValue({
+		id: 'cs_team',
+		url: 'https://checkout.stripe.com/c/pay/cs_team',
+	})
+	const teamOrgId = ownerIdFromStored('team-org-stable')
+	mockModule.readAuthenticatedAppUser.mockResolvedValue({
+		...authenticatedUser,
+		request: deriveRequestContext({
+			user: authenticatedUser.mcpUser,
+			source: { kind: 'session' },
+			orgBinding: {
+				org: { id: teamOrgId, slug: 'team-co' },
+				role: 'owner',
+			},
+		}),
+	})
+	const env = createEnv()
+	const response = await postCheckout(env, { plan: 'pro' })
+	expect(response.status).toBe(200)
+	expect(mockModule.createCheckoutSession).toHaveBeenLastCalledWith(
+		env,
+		expect.objectContaining({
+			metadata: expect.objectContaining({ kody_org_id: teamOrgId }),
+		}),
+	)
+})
+
 function subscription(input: { id: string; status: string; priceId: string }) {
 	return {
 		id: input.id,
@@ -306,6 +338,7 @@ test('billing checkout routes existing subscribers through the portal update flo
 			priceId: 'price_pro_yearly',
 			afterCompletionRedirectUrl:
 				'https://example.com/account/billing?billing=updated',
+			quantity: 1,
 		},
 	})
 	expect(mockModule.createCheckoutSession).toHaveBeenCalledTimes(1)
@@ -338,15 +371,21 @@ test('billing checkout routes existing subscribers through the portal update flo
 	expect(mockModule.createBillingPortalSession).toHaveBeenCalledTimes(2)
 	expect(mockModule.createCheckoutSession).toHaveBeenCalledTimes(1)
 
-	// Legacy double subscriptions: plain portal (no flow) so the customer can
-	// pick which one to keep.
+	// Legacy double Kody subscriptions: plain portal (no flow) so the customer
+	// can pick which one to keep. Both must use known Kody prices; an unmapped
+	// shared-account product must not count toward this branch.
 	mockModule.listSubscriptions.mockResolvedValueOnce([
 		subscription({
 			id: 'sub_standard',
 			status: 'active',
-			priceId: 'price_standard',
+			priceId: retiredStandardPriceId,
 		}),
 		subscription({ id: 'sub_pro', status: 'trialing', priceId: 'price_pro' }),
+		subscription({
+			id: 'sub_gratitext',
+			status: 'active',
+			priceId: 'price_gratitext_premium_15',
+		}),
 	])
 	const doubled = await postCheckout(env, { plan: 'pro', interval: 'year' })
 	expect(doubled.status).toBe(200)

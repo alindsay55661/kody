@@ -158,6 +158,9 @@ Open these before proposing a new primitive, surface, or storage home.
   stamp `orgId` on grant props and metadata; `?org=` plus consent picker (no
   flag; one org = no picker); connection profiles stay org-bound narrowing, not
   OAuth scopes; `userId` fallback until P9
+- [0065 — Org seats, prepaid credits, and Free-tier fallback at $0](./0065-org-seats-and-free-tier-fallback.md)
+  — org-billed seats and credits; empty wallet uses Free rate/compute limits
+  (supersedes 0051 hard stop); Stripe writes stay Kody-only
 
 ## Historical / UI / implementation
 

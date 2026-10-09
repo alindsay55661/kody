@@ -3,7 +3,10 @@ import { callerCanAccessCapability } from '#mcp/capabilities/access-control.ts'
 import { getStaticRegistry } from '#mcp/capabilities/registry.ts'
 import { type Capability } from '#mcp/capabilities/types.ts'
 import { authorizeSurface } from '#worker/authorization/authorize.ts'
-import { recordUsage } from '#worker/usage/record-usage.ts'
+import {
+	recordUsage,
+	usageAttributionFieldsFromRequest,
+} from '#worker/usage/record-usage.ts'
 import {
 	toCapabilityOpenApiPrincipal,
 	type ApiInvocationContext,
@@ -187,6 +190,7 @@ export async function invokeApiOperation(input: {
 				entityId,
 				durationMs: Date.now() - startedAt,
 				outcome,
+				...usageAttributionFieldsFromRequest(input.ctx.callerContext.request),
 			},
 			input.ctx.waitUntil ? { waitUntil: input.ctx.waitUntil } : undefined,
 		)

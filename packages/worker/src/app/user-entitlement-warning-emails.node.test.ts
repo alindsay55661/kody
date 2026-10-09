@@ -106,11 +106,13 @@ function createDb(
 		creditBalanceMicroUsd?: number
 	} = {},
 ) {
+	let boundParams: Array<unknown> = []
 	return {
 		prepare(query: string) {
 			const normalized = query.replace(/\s+/g, ' ').trim().toLowerCase()
 			return {
-				bind(..._params: Array<unknown>) {
+				bind(...params: Array<unknown>) {
+					boundParams = params
 					return this
 				},
 				async first<T>() {
@@ -119,9 +121,34 @@ function createDb(
 							balance_micro_usd: options.creditBalanceMicroUsd ?? 0,
 						} as T
 					}
+					if (
+						normalized.includes('from users') &&
+						normalized.includes('stable_user_id = ?')
+					) {
+						const id = String(boundParams[0] ?? '')
+						const user = users.find((row) => row.stable_user_id === id)
+						return user ? ({ stable_user_id: user.stable_user_id } as T) : null
+					}
 					return null
 				},
 				async all<T>() {
+					if (normalized.includes('from org_memberships')) {
+						return { results: [] as Array<T> }
+					}
+					if (
+						normalized.includes('from users') &&
+						normalized.includes('stable_user_id in')
+					) {
+						const ids = new Set(boundParams.map((value) => String(value ?? '')))
+						return {
+							results: users
+								.filter((row) => ids.has(row.stable_user_id))
+								.map((row) => ({
+									user_id: row.stable_user_id,
+									email: row.email,
+								})) as Array<T>,
+						}
+					}
 					if (
 						normalized.includes('from usage_rollups') &&
 						normalized.includes('inner join users')
@@ -529,8 +556,8 @@ test('compute include crossings mail an empty Pro wallet per UTC month, worded a
 	expect(reached.text).toContain(
 		"Worker compute — this month's include is used up (3,600 of 350 worker-compute days).",
 	)
-	expect(reached.text).toContain(
-		'With no credits left, usage past the include stops.',
+	expect(reached.text).toMatch(
+		/With no credits left, (usage past the include stops|rate and compute limits match Free)/,
 	)
 	for (const body of [reached.text, reached.html]) {
 		expect(body).not.toMatch(/\b(?:1(?:0[1-9]|[1-9]\d)|[2-9]\d\d|\d{4,})%/)

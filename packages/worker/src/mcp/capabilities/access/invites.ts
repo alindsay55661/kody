@@ -29,6 +29,8 @@ import {
 	type GrantResourceType,
 	type StoredInvite,
 } from '#worker/orgs/access-writes.ts'
+import { assertCanAcceptFreeOrgOwnership } from '#worker/orgs/billing.ts'
+import { syncSeatsAfterMembershipChange } from '#worker/orgs/seat-sync-after-membership.ts'
 import {
 	authorizeGrantTarget,
 	generateInviteToken,
@@ -184,12 +186,20 @@ async function assertInviteTargetsStillValid(
 
 async function acceptStoredInvite(input: {
 	db: D1Database
+	env: Env
 	invite: StoredInvite
 	acceptedByUserId: string
 }) {
 	const { invite } = input
 	await assertInviterStillValid(input.db, invite)
 	await assertInviteTargetsStillValid(input.db, invite)
+	if (invite.kind === 'membership' && (invite.role ?? 'member') === 'owner') {
+		await assertCanAcceptFreeOrgOwnership({
+			db: input.db,
+			orgId: invite.orgId,
+			userId: input.acceptedByUserId,
+		})
+	}
 	// Claim the invite before side effects so a concurrent redeem loses the
 	// pending→accepted compare-and-set instead of applying access twice.
 	try {
@@ -225,6 +235,13 @@ async function acceptStoredInvite(input: {
 					teamId,
 					userId: input.acceptedByUserId,
 					addedByUserId: invite.invitedByUserId,
+				})
+			}
+			if (role === 'owner' || role === 'member') {
+				await syncSeatsAfterMembershipChange({
+					db: input.db,
+					env: input.env,
+					orgId: invite.orgId,
 				})
 			}
 			break
@@ -458,6 +475,7 @@ export const inviteAcceptCapability = defineDomainCapability(
 				const org = await requireLiveOrg(db, invite.orgId)
 				await acceptStoredInvite({
 					db,
+					env: ctx.env,
 					invite,
 					acceptedByUserId: user.userId,
 				})
