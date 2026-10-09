@@ -8,10 +8,12 @@ import { AccountConnectionsRoute } from '#client/routes/account-connections.tsx'
 import {
 	accountNavItemsFor,
 	accountPackagesNavHref,
+	accountRailOrgSlug,
 } from '#client/routes/account-management-components.tsx'
 import { type SessionInfo } from '#client/session.ts'
 import {
 	accountConnectionAgentIds,
+	accountConnectionsListHref,
 	accountConnectionsNewHref,
 	parseAccountConnectionsPathname,
 } from '#universal/account-connections.ts'
@@ -91,7 +93,7 @@ test('connections page renders the connected list with Add connection, the MCP U
 	// No cold-path loading copy when the SSR payload is present.
 	expect(html).not.toContain('Loading connections')
 	// The rail marks this page current and links Repositories to the profile.
-	expect(html).toMatch(/href="\/account\/connections"[^>]*aria-current="page"/)
+	expect(html).toMatch(/href="\/@jane\/connections"[^>]*aria-current="page"/)
 	expect(html).toMatch(/href="\/@jane"[^>]*>[\s\S]*?Repositories<\/a>/)
 	expect(html).toContain('data-icon="box"')
 })
@@ -175,7 +177,7 @@ test('picking a client shows that host’s install steps with a way back to the 
 	)
 	expect(html).not.toContain('aria-label="Connected agents"')
 	// Connections stays the current rail item on the add views.
-	expect(html).toMatch(/href="\/account\/connections"[^>]*aria-current="page"/)
+	expect(html).toMatch(/href="\/@jane\/connections"[^>]*aria-current="page"/)
 })
 
 test('an unknown agent segment renders the fallback instead of instructions', async () => {
@@ -200,6 +202,10 @@ test('connections views parse from the pathname', () => {
 		['/account/connections/new/nope', null],
 		['/account/connections/new/cursor/x', null],
 		['/account/connections/nope', null],
+		['/@jane/connections', { kind: 'list' }],
+		['/@jane/connections/new', { kind: 'new', agent: null }],
+		['/@jane/connections/new/cursor', { kind: 'new', agent: 'cursor' }],
+		['/@jane/connections/new/nope', null],
 	] as const
 	expect(
 		cases.map(([pathname]) => [
@@ -211,6 +217,26 @@ test('connections views parse from the pathname', () => {
 	expect(accountConnectionsNewHref('grok-cli')).toBe(
 		'/account/connections/new/grok-cli',
 	)
+	expect(accountConnectionsListHref('/@jane/connections')).toBe(
+		'/@jane/connections',
+	)
+	expect(accountConnectionsNewHref(null, '/@jane/connections')).toBe(
+		'/@jane/connections/new',
+	)
+	expect(accountConnectionsNewHref('cursor', '/@jane/connections')).toBe(
+		'/@jane/connections/new/cursor',
+	)
+})
+
+test('connections list under /@slug keeps Add and View steps on org paths', async () => {
+	const html = await renderConnectionsPage(
+		connectedCursor,
+		'/@jane/connections',
+	)
+	expect(html).toContain('href="/@jane/connections/new"')
+	expect(html).toContain('href="/@jane/connections/new/cursor"')
+	expect(html).not.toContain('href="/account/connections/new"')
+	expect(html).not.toContain('href="/account/connections/new/cursor"')
 })
 
 test('connections page swaps the copy card for a verify note while the email is unverified', async () => {
@@ -287,25 +313,64 @@ test('connection profiles list only granted packages and add more through a pack
 
 test('account rail lists Connections and Repositories at the same level as the other sections', () => {
 	const items = accountNavItemsFor({
-		username: 'jane',
+		orgSlug: 'jane',
+		personal: true,
 		showShared: true,
 	})
 	expect(items.map((item) => item.label)).toContain('Shared')
 	expect(items.map((item) => item.label)).toContain('Secret providers')
 	expect(items.find((item) => item.label === 'Secret providers')?.href).toBe(
-		'/account/secret-providers',
+		'/@jane/secret-providers',
 	)
 	expect(items.map((item) => item.label)).toContain('Experiments')
 	expect(items.find((item) => item.label === 'Experiments')?.href).toBe(
 		'/account/experiments',
 	)
 	expect(items.find((item) => item.label === 'Connections')?.href).toBe(
-		'/account/connections',
+		'/@jane/connections',
 	)
 	// Repositories is the profile page — the canonical repo list — not the
 	// `/account/packages` redirect, unless the session has no username yet.
 	expect(items.find((item) => item.label === 'Repositories')?.href).toBe(
 		'/@jane',
 	)
-	expect(accountPackagesNavHref(null)).toBe('/account/packages')
+	expect(accountPackagesNavHref({ orgSlug: null, personal: true })).toBe(
+		'/account/packages',
+	)
+})
+
+test('account rail keeps the selected organization slug for section links', () => {
+	const items = accountNavItemsFor({
+		orgSlug: 'acme',
+		personal: false,
+		showShared: false,
+	})
+	expect(items.find((item) => item.label === 'Secrets')?.href).toBe(
+		'/@acme/secrets',
+	)
+	expect(items.find((item) => item.label === 'Jobs')?.href).toBe('/@acme/jobs')
+	expect(items.find((item) => item.label === 'Repositories')?.href).toBe(
+		'/@acme/packages',
+	)
+})
+
+test('account rail org slug prefers the path org over username', () => {
+	const organizations = [
+		{ slug: 'ada-old', personal: true },
+		{ slug: 'acme', personal: false },
+	]
+	expect(
+		accountRailOrgSlug({
+			pathname: '/@acme/jobs',
+			organizations,
+			username: 'ada-new',
+		}),
+	).toBe('acme')
+	expect(
+		accountRailOrgSlug({
+			pathname: '/account',
+			organizations,
+			username: 'ada-new',
+		}),
+	).toBe('ada-old')
 })

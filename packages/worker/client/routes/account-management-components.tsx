@@ -1,5 +1,10 @@
 import { css, type Handle, type RemixNode } from 'remix/component'
 import { routes } from '#universal/routes.ts'
+import {
+	accountNavItemsFor,
+	accountRailOrgSlug,
+	isAccountNavItemActive,
+} from './account-rail.ts'
 import { CopyTextButton } from '#client/copy-text-button.tsx'
 import { on } from '#client/event-mixin.ts'
 import { formatNullableTimestamp } from '#client/format-timestamp.ts'
@@ -383,71 +388,11 @@ const adminNavItems = [
 	paths: ReadonlyArray<string>
 }>
 
-/**
- * Packages live on the signed-in user's public profile (`/@username`);
- * `/account/packages` only 302s there. Link straight to the canonical page
- * when the session knows the username and let the redirect cover the rare
- * case where it does not, so the rail never points at a dead route.
- */
-export function accountPackagesNavHref(username: string | null | undefined) {
-	return username
-		? routes.profile.href({ username })
-		: routes.accountPackages.href()
-}
-
-type AccountNavItem = { href: string; label: string; icon: IconName }
-
-/** Account rail items in display order for the signed-in session. */
-export function accountNavItemsFor(input: {
-	username: string | null | undefined
-	showShared: boolean
-}): Array<AccountNavItem> {
-	return [
-		{ href: '/account', label: 'Overview', icon: 'home' },
-		{ href: '/account/waiting', label: 'Waiting', icon: 'clock' },
-		{ href: '/account/experiments', label: 'Experiments', icon: 'star' },
-		{
-			href: routes.accountConnections.href(),
-			label: 'Connections',
-			icon: 'link',
-		},
-		{
-			href: accountPackagesNavHref(input.username),
-			label: 'Repositories',
-			icon: 'box',
-		},
-		...(input.showShared
-			? [
-					{
-						href: routes.accountShared.href(),
-						label: 'Shared',
-						icon: 'share' as const,
-					},
-				]
-			: []),
-		{ href: '/account/billing', label: 'Billing', icon: 'wallet' },
-		{ href: '/account/usage', label: 'Usage', icon: 'chart' },
-		{ href: '/account/activity', label: 'Activity', icon: 'trending-up' },
-		{ href: '/account/jobs', label: 'Jobs', icon: 'briefcase' },
-		{ href: '/account/workflows', label: 'Workflows', icon: 'refresh' },
-		{ href: routes.accountWebhooks.href(), label: 'Webhooks', icon: 'cloud' },
-		{ href: '/account/secrets', label: 'Secrets', icon: 'key' },
-		{
-			href: '/account/secret-providers',
-			label: 'Secret providers',
-			icon: 'key',
-		},
-		{ href: '/account/integrations', label: 'Integrations', icon: 'plug' },
-		{ href: '/account/mcp-servers', label: 'MCP servers', icon: 'server' },
-		{ href: '/account/memories', label: 'Memories', icon: 'book' },
-		{ href: '/account/email', label: 'Email', icon: 'mail' },
-	]
-}
-
-function isAccountNavItemActive(itemHref: string, currentPath: string) {
-	if (itemHref === '/account') return currentPath === '/account'
-	return currentPath === itemHref || currentPath.startsWith(`${itemHref}/`)
-}
+export {
+	accountNavItemsFor,
+	accountPackagesNavHref,
+	accountRailOrgSlug,
+} from './account-rail.ts'
 
 type AccountPageHeaderProps = {
 	title: string
@@ -469,13 +414,23 @@ export function AccountPageHeader(handle: Handle<AccountPageHeaderProps>) {
 		const currentPath = new URL(handle.props.currentHref, 'http://localhost')
 			.pathname
 		const session = readAppSession(handle)?.session ?? null
+		const organizations = session?.organizations ?? []
+		const orgSlug = accountRailOrgSlug({
+			pathname: currentPath,
+			organizations,
+			username: session?.username,
+		})
+		const personal =
+			organizations.find((org) => org.slug === orgSlug)?.personal ??
+			Boolean(orgSlug && orgSlug === session?.username)
 		const showShared = isFeatureFlagEnabled(session, packageShareGrantsFlagKey)
 		const explainer =
 			!showShared && currentPath === routes.accountShared.href()
 				? null
 				: resolveEntityExplainer(currentPath)
 		const navItems = accountNavItemsFor({
-			username: session?.username,
+			orgSlug,
+			personal,
 			showShared,
 		})
 
