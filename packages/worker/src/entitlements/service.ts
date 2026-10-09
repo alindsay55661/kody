@@ -265,6 +265,51 @@ export async function resolveUserEntitlementFromRow(input: {
  * paid access remains continuous. The credit wallet is `funded` only for
  * the purchasable Pro with a positive balance.
  */
+async function loadEntitlementRowForStableUserId(
+	db: D1Database,
+	input: { stableUserId: string; email: string | null | undefined },
+): Promise<UserEntitlementRow | null> {
+	const orgColumns = userEntitlementColumnsSql('o')
+	const userColumns = userEntitlementColumnsSql('u')
+	const email = input.email?.trim().toLowerCase()
+
+	// When email is provided, require a live users row for (email, stable id)
+	// before reading org billing — a mismatched caller context must not inherit
+	// another account's plan. Prefer orgs; fall back to users columns.
+	if (email) {
+		const orgRow = await db
+			.prepare(
+				`SELECT ${orgColumns}
+				 FROM users u
+				 INNER JOIN orgs o ON o.id = u.stable_user_id
+				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL`,
+			)
+			.bind(email, input.stableUserId)
+			.first<UserEntitlementRow>()
+		if (orgRow) return orgRow
+
+		return await db
+			.prepare(
+				`SELECT ${userColumns}
+				 FROM users u
+				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL`,
+			)
+			.bind(email, input.stableUserId)
+			.first<UserEntitlementRow>()
+	}
+
+	const orgRow = await db
+		.prepare(`SELECT ${orgColumns} FROM orgs o WHERE o.id = ?`)
+		.bind(input.stableUserId)
+		.first<UserEntitlementRow>()
+	if (orgRow) return orgRow
+
+	return await db
+		.prepare(`SELECT ${userColumns} FROM users u WHERE u.stable_user_id = ?`)
+		.bind(input.stableUserId)
+		.first<UserEntitlementRow>()
+}
+
 export async function getUserEntitlement(
 	db: D1Database,
 	input: { userId: string; email: string | null | undefined },
@@ -272,15 +317,10 @@ export async function getUserEntitlement(
 	const email = input.email?.trim().toLowerCase()
 	if (!input.userId) return publicFreeEntitlement
 	if (!stableUserIdPattern.test(input.userId)) return publicFreeEntitlement
-	const columns = userEntitlementColumnsSql()
-	const row = await db
-		.prepare(
-			email
-				? `SELECT ${columns} FROM users WHERE email = ? AND stable_user_id = ?`
-				: `SELECT ${columns} FROM users WHERE stable_user_id = ?`,
-		)
-		.bind(...(email ? [email, input.userId] : [input.userId]))
-		.first<UserEntitlementRow>()
+	const row = await loadEntitlementRowForStableUserId(db, {
+		stableUserId: input.userId,
+		email,
+	})
 	if (!row) return publicFreeEntitlement
 	return await resolveUserEntitlementFromRow({
 		db,

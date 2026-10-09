@@ -29,6 +29,11 @@ import {
 	updatePackagesForUsernameChange,
 } from '#worker/package-registry/username-change-packages.ts'
 import { createDb, usersTable } from '#worker/db.ts'
+import {
+	renameUserHandle,
+	rollbackUserHandleRename,
+} from '#worker/orgs/provision.ts'
+import { isUsernameClaimedInIdentity } from '#worker/identity/generated-username.ts'
 
 type AuthenticatedUser = NonNullable<
 	Awaited<ReturnType<typeof readAuthenticatedAppUser>>
@@ -128,10 +133,11 @@ export function createAccountProfileApiHandler(env: Env) {
 					)
 				}
 
-				const existingUsername = await db.findOne(usersTable, {
-					where: { username },
-				})
-				if (existingUsername && existingUsername.id !== user.userId) {
+				if (
+					await isUsernameClaimedInIdentity(env.APP_DB, username, {
+						exceptStableUserId: user.mcpUser.userId,
+					})
+				) {
 					void logAuditEvent({
 						db: auditDatabaseFromEnv(env),
 						category: 'account',
@@ -183,6 +189,65 @@ export function createAccountProfileApiHandler(env: Env) {
 				// fails; rollback below invalidates again after restoring.
 				invalidatePackageAppOwnerCache({ stableUserId: packageUserId })
 
+				try {
+					await renameUserHandle(env.APP_DB, {
+						stableUserId: packageUserId,
+						oldUsername: previousUsername,
+						newUsername: username,
+					})
+				} catch (error) {
+					try {
+						await rollbackUserHandleRename(env.APP_DB, {
+							stableUserId: packageUserId,
+							claimedUsername: username,
+							restoreUsername: previousUsername,
+						})
+					} catch (rollbackError) {
+						console.error(
+							JSON.stringify({
+								message: 'username-change handle rollback failed',
+								userId: packageUserId,
+								error: getErrorMessage(rollbackError),
+							}),
+						)
+					}
+					try {
+						await db.update(usersTable, user.userId, {
+							username: previousUsername,
+							updated_at: utcSqliteTimestamp(),
+						})
+						invalidatePackageAppOwnerCache({
+							stableUserId: packageUserId,
+						})
+					} catch (rollbackError) {
+						console.error(
+							JSON.stringify({
+								message:
+									'username-change user rollback failed after handle error',
+								userId: packageUserId,
+								error: getErrorMessage(rollbackError),
+							}),
+						)
+					}
+					void logAuditEvent({
+						db: auditDatabaseFromEnv(env),
+						category: 'account',
+						action: 'update_username',
+						result: 'failure',
+						email: user.email,
+						ip: requestIp,
+						path: url.pathname,
+						reason: 'handle_update_failed',
+					})
+					return jsonResponse(
+						{
+							ok: false,
+							error: `Username was not changed because handle updates failed: ${getErrorMessage(error)}`,
+						},
+						500,
+					)
+				}
+
 				const claimed = await db.findOne(usersTable, {
 					where: { id: user.userId },
 				})
@@ -204,6 +269,11 @@ export function createAccountProfileApiHandler(env: Env) {
 					})
 				} catch (error) {
 					try {
+						await rollbackUserHandleRename(env.APP_DB, {
+							stableUserId: packageUserId,
+							claimedUsername: username,
+							restoreUsername: previousUsername,
+						})
 						await db.update(usersTable, user.userId, {
 							username: previousUsername,
 							updated_at: utcSqliteTimestamp(),

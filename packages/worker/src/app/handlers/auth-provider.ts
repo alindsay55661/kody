@@ -78,6 +78,10 @@ import {
 	reconcileSignupWelcomeCreditsIfPending,
 } from '#worker/billing/signup-welcome-credits.ts'
 import { attributeReferralAtSignup } from '#worker/entitlements/referral-program.ts'
+import {
+	provisionPersonalOrgForSignup,
+	rollbackPersonalOrgAfterFailedSignup,
+} from '#worker/orgs/signup-provision.ts'
 import { touchLastActiveAt } from '#worker/identity/activation-stamps.ts'
 import { parseLegacyHosts } from '#worker/app-legacy-redirect.ts'
 import {
@@ -723,6 +727,22 @@ export function createAuthProviderCallbackHandler(env: Env) {
 				stable_user_id: string
 				email: string
 			} | null = null
+
+			async function rollbackNewUser(userId: number) {
+				invalidatePackageAppOwnerCache({ stableUserId })
+				await rollbackPersonalOrgAfterFailedSignup(env.APP_DB, stableUserId)
+				try {
+					await env.APP_DB.prepare(`DELETE FROM users WHERE id = ?`)
+						.bind(userId)
+						.run()
+				} catch (rollbackError) {
+					console.error(
+						'Failed to roll back OAuth-created user row:',
+						rollbackError,
+					)
+				}
+			}
+
 			try {
 				username = await getAvailableUsernameFromBase(
 					env.APP_DB,
@@ -762,7 +782,18 @@ export function createAuthProviderCallbackHandler(env: Env) {
 					{ returnRow: true },
 				)
 				newUser = { id: createdUser.id, stable_user_id: stableUserId, email }
+				await provisionPersonalOrgForSignup(env.APP_DB, {
+					stableUserId,
+					username,
+					createdAt,
+					accountType: 'person',
+					plan: resolvePlanWrite(null),
+					signupWelcomeCreditsPending: 1,
+				})
 			} catch (error) {
+				if (newUser) {
+					await rollbackNewUser(newUser.id)
+				}
 				const uniqueField = getUniqueConstraintField(error)
 				if (uniqueField === 'stable_user_id') {
 					return fail('email-claimed', 'former_email_claimed')
@@ -773,15 +804,8 @@ export function createAuthProviderCallbackHandler(env: Env) {
 				throw error
 			}
 
-			async function rollbackNewUser(userId: number) {
-				invalidatePackageAppOwnerCache({ stableUserId })
-				try {
-					await env.APP_DB.prepare(`DELETE FROM users WHERE id = ?`)
-						.bind(userId)
-						.run()
-				} catch (error) {
-					console.error('Failed to roll back OAuth-created user row:', error)
-				}
+			if (!newUser) {
+				return fail('account-error', 'user_create_conflict')
 			}
 
 			let assigned = false

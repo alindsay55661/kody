@@ -64,13 +64,16 @@ const countedTables = [
 function createEntitlementsTestDb(
 	input: {
 		users?: Array<TestUser>
+		orgs?: Array<TestUser>
 		counts?: Partial<Record<(typeof countedTables)[number], number>>
 	} = {},
 ) {
 	const users = input.users ?? []
+	const orgs = input.orgs ?? []
 	const counts = input.counts ?? {}
 	const queries: Array<{ sql: string; params: Array<unknown> }> = []
 	const byId = (id: unknown) => users.find((row) => row.stable_user_id === id)
+	const orgById = (id: unknown) => orgs.find((row) => row.stable_user_id === id)
 	const planRow = (user: TestUser | undefined) =>
 		user
 			? {
@@ -84,20 +87,28 @@ function createEntitlementsTestDb(
 				}
 			: null
 
+	function entitlementPlanFirst(query: string, params: Array<unknown>) {
+		// Pair match is required: omitted bind params or email-only fixtures
+		// must not resolve a plan.
+		if (query.includes('email = ?')) {
+			return planRow(
+				users.find(
+					(row) => row.email === params[0] && row.stable_user_id === params[1],
+				),
+			)
+		}
+		return planRow(byId(params[0]))
+	}
+
 	function first(query: string, params: Array<unknown>) {
 		if (query.includes('FROM credit_wallets')) return null
-		if (/SELECT plan(, [a-z_, ]+)? FROM users/.test(query)) {
-			// Pair match is required: omitted bind params or email-only fixtures
-			// must not resolve a plan.
-			if (query.includes('email = ?')) {
-				return planRow(
-					users.find(
-						(row) =>
-							row.email === params[0] && row.stable_user_id === params[1],
-					),
-				)
-			}
-			return planRow(byId(params[0]))
+		// Org-first entitlement read joined to a verified users row.
+		if (query.includes('INNER JOIN orgs')) {
+			const user = users.find(
+				(row) => row.email === params[0] && row.stable_user_id === params[1],
+			)
+			if (!user) return null
+			return planRow(orgById(user.stable_user_id))
 		}
 		if (query.includes('SELECT email, plan, email_verified_at')) {
 			const user = byId(params[0])
@@ -105,7 +116,20 @@ function createEntitlementsTestDb(
 				? { email: user.email, plan: user.plan, email_verified_at: null }
 				: null
 		}
+		if (/FROM orgs(?:\s|$)/.test(query) || /FROM orgs o\b/.test(query)) {
+			return planRow(orgById(params[0]))
+		}
+		if (/FROM users(?:\s|$)/.test(query) || /FROM users u\b/.test(query)) {
+			return entitlementPlanFirst(query, params)
+		}
 		if (query.includes('SELECT 1 AS present FROM users')) {
+			if (query.includes('email = ?')) {
+				return users.some(
+					(row) => row.email === params[0] && row.stable_user_id === params[1],
+				)
+					? { present: 1 }
+					: null
+			}
 			return byId(String(params[0])) ? { present: 1 } : null
 		}
 		const table = countedTables.find((name) => query.includes(`FROM ${name}`))
@@ -142,7 +166,12 @@ async function createPlannedUserDb(
 	const users = [
 		{ email: plannedEmail, plan, stable_user_id: userId, ...extra },
 	]
-	return { userId, users, ...createEntitlementsTestDb({ users }) }
+	// P3: entitlement reads prefer orgs; mirror the planned user as its org.
+	return {
+		userId,
+		users,
+		...createEntitlementsTestDb({ users, orgs: users }),
+	}
 }
 
 async function expectLimitError(promise: Promise<unknown>) {
@@ -367,14 +396,16 @@ test('getUserPlan resolves plans, defaults unresolved contexts to free, and reje
 	expect(
 		await getUserPlan(db, { userId, email: ' Planned@Example.com ' }),
 	).toBe('pro')
-	expect(queries.at(-1)?.sql).toContain('email = ? AND stable_user_id = ?')
+	expect(queries.at(-1)?.sql).toMatch(
+		/u\.email = \? AND u\.stable_user_id = \?/,
+	)
 	expect(queries.at(-1)?.params).toEqual([plannedEmail, userId])
 
 	// Background contexts reverse-resolve valid stable ids when their persisted
 	// email is blank or missing.
 	for (const email of [null, undefined, '   ']) {
 		expect(await getUserPlan(db, { userId, email })).toBe('pro')
-		expect(queries.at(-1)?.sql).toContain('WHERE stable_user_id = ?')
+		expect(queries.at(-1)?.sql).toMatch(/WHERE (?:u\.)?stable_user_id = \?/)
 		expect(queries.at(-1)?.params).toEqual([userId])
 	}
 
@@ -387,6 +418,21 @@ test('getUserPlan resolves plans, defaults unresolved contexts to free, and reje
 	).rejects.toThrow('Stored plan is not a registered plan name.')
 })
 
+test('getUserPlan ignores org billing when email does not match the stable user id', async () => {
+	const userId = testStableUserIdFromEmail(plannedEmail)
+	const { db } = createEntitlementsTestDb({
+		users: [{ email: plannedEmail, plan: 'free', stable_user_id: userId }],
+		orgs: [{ email: plannedEmail, plan: 'max', stable_user_id: userId }],
+	})
+	expect(
+		await getUserPlan(db, {
+			userId,
+			email: 'attacker@example.com',
+		}),
+	).toBe('free')
+	expect(await getUserPlan(db, { userId, email: plannedEmail })).toBe('max')
+})
+
 test('getCachedUserPlan caches per db binding and never caches failures', async () => {
 	const { userId, users, db, queries } = await createPlannedUserDb('pro')
 	const context = { userId, email: plannedEmail }
@@ -394,8 +440,10 @@ test('getCachedUserPlan caches per db binding and never caches failures', async 
 	expect(await getCachedUserPlan(db, context)).toBe('pro')
 	expect(await getCachedUserPlan(db, context)).toBe('pro')
 	expect(
-		queries.filter((query) =>
-			query.sql.includes('email = ? AND stable_user_id = ?'),
+		queries.filter(
+			(query) =>
+				/email = \? AND (?:u\.)?stable_user_id = \?/.test(query.sql) &&
+				!query.sql.includes('SELECT 1 AS present'),
 		),
 	).toHaveLength(1)
 
@@ -506,8 +554,10 @@ test('assertWithinEntitlement reuses cached plan within TTL while still enforcin
 			},
 		})
 	const planQueries = () =>
-		queries.filter((query) =>
-			query.sql.includes('email = ? AND stable_user_id = ?'),
+		queries.filter(
+			(query) =>
+				/email = \? AND (?:u\.)?stable_user_id = \?/.test(query.sql) &&
+				!query.sql.includes('SELECT 1 AS present'),
 		)
 
 	await check()
