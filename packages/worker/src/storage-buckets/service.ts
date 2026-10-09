@@ -30,6 +30,7 @@ import {
  * recreate an inventory row that account, package, or job deletion removed.
  */
 
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 export type StorageBucketKind =
 	| 'job'
 	| 'package'
@@ -274,7 +275,7 @@ export async function deleteStorageBucketInventory(input: {
 	const result = await input.db
 		.prepare(
 			`DELETE FROM user_storage_buckets
-			WHERE user_id = ? AND storage_id = ?`,
+			WHERE user_id = ? AND storage_id = ?${andLiveDeletedAtSql()}`,
 		)
 		.bind(input.userId, input.storageId)
 		.run()
@@ -334,9 +335,8 @@ export async function listStorageBucketsMissingEstimates(input: {
 		.prepare(
 			`SELECT user_id AS userId, storage_id AS storageId, kind
 			FROM user_storage_buckets
-			WHERE estimated_bytes IS NULL
-			ORDER BY last_seen_at DESC, user_id ASC, storage_id ASC
-			LIMIT ?`,
+			WHERE estimated_bytes IS NULL${andLiveDeletedAtSql()}
+			ORDER BY last_seen_at DESC, user_id ASC, storage_id ASC LIMIT ?`,
 		)
 		.bind(input.limit)
 		.all<{
@@ -455,7 +455,7 @@ export async function listUserStorageBucketIds(input: {
 	const result = await input.env.APP_DB.prepare(
 		`SELECT storage_id AS storageId
 		FROM user_storage_buckets
-		WHERE user_id = ? AND kind <> 'repo_session'
+		WHERE user_id = ? AND kind <> 'repo_session'${andLiveDeletedAtSql()}
 		ORDER BY storage_id ASC`,
 	)
 		.bind(input.userId)
@@ -481,7 +481,7 @@ export async function listUserStorageBucketEstimates(input: {
 	const result = await input.env.APP_DB.prepare(
 		`SELECT storage_id AS storageId, kind, estimated_bytes AS estimatedBytes
 		FROM user_storage_buckets
-		WHERE user_id = ?
+		WHERE user_id = ?${andLiveDeletedAtSql()}
 		ORDER BY storage_id ASC`,
 	)
 		.bind(input.userId)
@@ -507,7 +507,7 @@ export async function listPlatformStorageBuckets(input: {
 		.prepare(
 			`SELECT user_id AS userId, storage_id AS storageId
 			FROM user_storage_buckets
-			WHERE kind <> 'repo_session'
+			WHERE kind <> 'repo_session'${andLiveDeletedAtSql()}
 			ORDER BY user_id ASC, storage_id ASC`,
 		)
 		.all<{ userId: string; storageId: string }>()

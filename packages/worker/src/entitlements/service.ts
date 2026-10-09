@@ -43,6 +43,10 @@ import {
 } from './user-meter-client.ts'
 
 /** Env surface for authoritative entitlement usage readers. */
+import {
+	andLiveDeletedAtSql,
+	liveDeletedAtSql,
+} from '#worker/soft-delete/live-sql.ts'
 export type EntitlementUsageEnv = UserMeterEnv &
 	RepoSessionIndexEnv &
 	Pick<Env, 'RUN_LOG' | 'MAILBOX' | 'JOBS'>
@@ -278,7 +282,7 @@ async function loadEntitlementRowForStableUserId(
 				`SELECT ${orgColumns}
 				 FROM users u
 				 INNER JOIN orgs o ON o.id = u.stable_user_id
-				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL`,
+				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL${andLiveDeletedAtSql('u')}${andLiveDeletedAtSql('o')}`,
 			)
 			.bind(email, input.stableUserId)
 			.first<UserEntitlementRow>()
@@ -288,20 +292,24 @@ async function loadEntitlementRowForStableUserId(
 			.prepare(
 				`SELECT ${userColumns}
 				 FROM users u
-				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL`,
+				 WHERE u.email = ? AND u.stable_user_id = ? AND u.deleting_at IS NULL${andLiveDeletedAtSql('u')}`,
 			)
 			.bind(email, input.stableUserId)
 			.first<UserEntitlementRow>()
 	}
 
 	const orgRow = await db
-		.prepare(`SELECT ${orgColumns} FROM orgs o WHERE o.id = ?`)
+		.prepare(
+			`SELECT ${orgColumns} FROM orgs o WHERE o.id = ?${andLiveDeletedAtSql('o')}`,
+		)
 		.bind(input.stableUserId)
 		.first<UserEntitlementRow>()
 	if (orgRow) return orgRow
 
 	return await db
-		.prepare(`SELECT ${userColumns} FROM users u WHERE u.stable_user_id = ?`)
+		.prepare(
+			`SELECT ${userColumns} FROM users u WHERE u.stable_user_id = ?${andLiveDeletedAtSql('u')}`,
+		)
 		.bind(input.stableUserId)
 		.first<UserEntitlementRow>()
 }
@@ -472,7 +480,7 @@ export async function findUserAccountByStableUserId(
 		.prepare(
 			`SELECT email, plan, email_verified_at
 			 FROM users
-			 WHERE stable_user_id = ?`,
+			 WHERE stable_user_id = ?${andLiveDeletedAtSql()}`,
 		)
 		.bind(trimmed)
 		.first<{
@@ -941,7 +949,9 @@ async function userAccountRowExists(input: {
 	userId: string
 }): Promise<boolean> {
 	const row = await input.db
-		.prepare(`SELECT 1 AS present FROM users WHERE stable_user_id = ?`)
+		.prepare(
+			`SELECT 1 AS present FROM users WHERE stable_user_id = ?${andLiveDeletedAtSql()}`,
+		)
 		.bind(input.userId)
 		.first<{ present: number }>()
 	return row != null
@@ -1043,9 +1053,8 @@ export async function listUsersForD1StorageReconciliation(input: {
 		.prepare(
 			`SELECT stable_user_id AS userId
 			FROM users
-			WHERE stable_user_id > ?
-			ORDER BY stable_user_id ASC
-			LIMIT ?`,
+			WHERE stable_user_id > ?${andLiveDeletedAtSql()}
+			ORDER BY stable_user_id ASC LIMIT ?`,
 		)
 		.bind(lastUserId, input.limit)
 		.all<{ userId: string }>()
@@ -1056,6 +1065,7 @@ export async function listUsersForD1StorageReconciliation(input: {
 		.prepare(
 			`SELECT stable_user_id AS userId
 			FROM users
+			WHERE ${liveDeletedAtSql()}
 			ORDER BY stable_user_id ASC
 			LIMIT ?`,
 		)

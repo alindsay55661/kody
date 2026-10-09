@@ -1,3 +1,9 @@
+/**
+ * soft-delete-read-filter: opt-out
+ *
+ * Username and org-slug claim checks must see soft-deleted rows so reserved
+ * names stay taken during the restore window (Teams §10.3 full unique indexes).
+ */
 import {
 	getEffectiveUsernameValidationError,
 	normalizeUsername,

@@ -21,6 +21,7 @@ import {
 	resolveStripePriceCatalog,
 } from '#worker/billing/stripe-price-catalog.ts'
 import { type BillingEnv } from '#worker/billing/billing-config.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 
 const dayMs = 24 * 60 * 60 * 1000
 const launchFunnelSteps = [
@@ -153,7 +154,7 @@ export async function loadAdminLaunchSignals(input: {
 								)
 							THEN 1 ELSE 0 END) AS overlay_pro
 					 FROM users
-					 WHERE deleting_at IS NULL`,
+					 WHERE deleting_at IS NULL${andLiveDeletedAtSql()}`,
 				)
 				.bind(
 					platformPublicOpenedDay,
@@ -177,6 +178,7 @@ export async function loadAdminLaunchSignals(input: {
 					 FROM users
 					 WHERE deleting_at IS NULL
 						AND stripe_plan IN ('standard', 'pro')
+						${andLiveDeletedAtSql()}
 					 GROUP BY 1, 2`,
 				)
 				.all<PaidPriceRow>(),
@@ -196,6 +198,7 @@ export async function loadAdminLaunchSignals(input: {
 						COUNT(*) AS n
 					 FROM users
 					 WHERE deleting_at IS NULL
+						${andLiveDeletedAtSql()}
 					 GROUP BY 1`,
 				)
 				.bind(nowIso, nowIso)
@@ -206,6 +209,7 @@ export async function loadAdminLaunchSignals(input: {
 					 FROM users
 					 WHERE deleting_at IS NULL
 						AND first_mcp_connected_at IS NOT NULL
+						${andLiveDeletedAtSql()}
 					 GROUP BY 1`,
 				)
 				.all<NamedCountRow>(),

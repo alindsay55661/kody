@@ -1,6 +1,7 @@
 import { ensureUsersTestSchema } from '#worker/users-test-schema.ts'
 import { ensureUserStorageBucketsTestSchema } from '#worker/storage-buckets/test-schema.ts'
 import { ensureSecretBucketsTestSchema } from '#worker/secrets-test-schema.ts'
+import { ensureSoftDeleteTestColumns } from '#worker/soft-delete/test-schema.ts'
 import { communityForksDeleteCascadeStatements } from './community-forks-delete-cascade.ts'
 
 /**
@@ -280,4 +281,5 @@ export async function ensureCommunityFlowSchema(db: D1Database) {
 	} catch {
 		// Column already present.
 	}
+	await ensureSoftDeleteTestColumns(db)
 }

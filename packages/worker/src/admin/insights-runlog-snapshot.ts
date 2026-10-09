@@ -10,6 +10,7 @@ import {
 	type AdminInsightsWorkflowStatus,
 } from '#universal/loader-data.ts'
 
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 export const adminInsightsRunLogSnapshotKvKey = 'admin-insights-runlog:v1'
 
 /**
@@ -132,9 +133,8 @@ async function listNonDeletingInsightsUsers(db: D1Database): Promise<{
 			`SELECT stable_user_id, email_verified_at
 			 FROM users
 			 WHERE deleting_at IS NULL
-			   AND stable_user_id IS NOT NULL
-			 ORDER BY stable_user_id
-			 LIMIT ?`,
+			   AND stable_user_id IS NOT NULL${andLiveDeletedAtSql()}
+			 ORDER BY stable_user_id LIMIT ?`,
 		)
 		.bind(adminInsightsRunLogMaxUsersPerTick + 1)
 		.all<InsightsUserRow>()

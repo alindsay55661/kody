@@ -21,6 +21,7 @@ import {
 	type ApiTokenScope,
 } from './scopes.ts'
 
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 export const apiTokenPolicy = {
 	minIdleTtlSeconds: 60,
 	/** ADR 0056: idle timeout at most 14 days. */
@@ -314,7 +315,7 @@ async function pruneInactiveApiTokens(input: {
 		.prepare(
 			`DELETE FROM api_tokens
 			WHERE user_id = ?
-				AND (revoked_at < ? OR expires_at < ?)`,
+				AND (revoked_at < ? OR expires_at < ?)${andLiveDeletedAtSql()}`,
 		)
 		.bind(input.userId, cutoff, cutoff)
 		.run()
@@ -331,7 +332,7 @@ async function countActiveApiTokens(input: {
 			FROM api_tokens
 			WHERE user_id = ?
 				AND revoked_at IS NULL
-				AND expires_at > ?`,
+				AND expires_at > ?${andLiveDeletedAtSql()}`,
 		)
 		.bind(input.userId, input.now.toISOString())
 		.first<{ count: number }>()
@@ -362,7 +363,7 @@ async function listActiveApiTokenRecords(input: {
 			FROM api_tokens
 			WHERE user_id = ?
 				AND revoked_at IS NULL
-				AND expires_at > ?
+				AND expires_at > ?${andLiveDeletedAtSql()}
 			ORDER BY created_at ASC, id ASC`,
 		)
 		.bind(input.userId, input.now.toISOString())
@@ -605,7 +606,9 @@ export async function getApiTokenRecord(input: {
 	tokenId: string
 }) {
 	const row = await input.db
-		.prepare(`SELECT * FROM api_tokens WHERE id = ? AND user_id = ? LIMIT 1`)
+		.prepare(
+			`SELECT * FROM api_tokens WHERE id = ? AND user_id = ? ${andLiveDeletedAtSql()} LIMIT 1`,
+		)
 		.bind(input.tokenId, input.userId)
 		.first<Record<string, unknown>>()
 	return row ? mapRow(row) : null
@@ -622,7 +625,7 @@ export async function listApiTokens(input: {
 		.prepare(
 			`SELECT *
 			FROM api_tokens
-			WHERE user_id = ?
+			WHERE user_id = ?${andLiveDeletedAtSql()}
 			ORDER BY created_at DESC, id ASC`,
 		)
 		.bind(input.userId)
@@ -647,7 +650,7 @@ export async function revokeApiToken(input: {
 		.prepare(
 			`UPDATE api_tokens
 			SET revoked_at = ?, updated_at = ?
-			WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
+			WHERE id = ? AND user_id = ? AND revoked_at IS NULL${andLiveDeletedAtSql()}`,
 		)
 		.bind(nowIso, nowIso, input.tokenId, input.userId)
 		.run()
@@ -684,7 +687,7 @@ export async function rotateApiToken(input: {
 		.prepare(
 			`UPDATE api_tokens
 			SET token_hash = ?, expires_at = ?, rotated_at = ?, updated_at = ?
-			WHERE id = ? AND user_id = ? AND token_hash = ? AND revoked_at IS NULL`,
+			WHERE id = ? AND user_id = ? AND token_hash = ? AND revoked_at IS NULL${andLiveDeletedAtSql()}`,
 		)
 		.bind(
 			rotated.token_hash,
@@ -727,7 +730,9 @@ export async function authenticateApiToken(input: {
 	const parsed = parseApiToken(input.token)
 	if (!parsed) return { ok: false, reason: 'malformed' }
 	const row = await input.db
-		.prepare(`SELECT * FROM api_tokens WHERE id = ? LIMIT 1`)
+		.prepare(
+			`SELECT * FROM api_tokens WHERE id = ? ${andLiveDeletedAtSql()} LIMIT 1`,
+		)
 		.bind(parsed.tokenId)
 		.first<Record<string, unknown>>()
 	if (!row) return { ok: false, reason: 'unknown' }
@@ -793,7 +798,7 @@ export async function touchApiToken(input: {
 		.prepare(
 			`UPDATE api_tokens
 			SET expires_at = ?, last_used_at = ?
-			WHERE id = ? AND revoked_at IS NULL AND expires_at > ?`,
+			WHERE id = ? AND revoked_at IS NULL AND expires_at > ?${andLiveDeletedAtSql()}`,
 		)
 		.bind(input.record.expires_at, usedAt, input.record.id, usedAt)
 		.run()

@@ -28,6 +28,7 @@ import {
 	type InboundDueOwnersHealth,
 } from '#worker/email/inbound-due-owners.ts'
 import { loadDeliveryAlertEventsHealth } from '#worker/email/delivery-alert-events.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 
 /** Retention owner page size default/max (hard max). */
 export const adminMailboxMaintenanceRetentionMaxLimit = 20
@@ -132,9 +133,8 @@ export async function listUsersForAdminMailboxRetention(input: {
 					WHERE u.deleting_at IS NULL
 						AND u.stable_user_id IS NOT NULL
 						AND u.stable_user_id != ?
-						AND u.stable_user_id > ?
-					ORDER BY u.stable_user_id ASC
-					LIMIT ?`,
+						AND u.stable_user_id > ?${andLiveDeletedAtSql()}
+					ORDER BY u.stable_user_id ASC LIMIT ?`,
 				)
 				.bind(systemEmailOwnerId, startAfter, input.limit)
 				.all<{ userId: string }>()
@@ -144,9 +144,8 @@ export async function listUsersForAdminMailboxRetention(input: {
 					FROM users u
 					WHERE u.deleting_at IS NULL
 						AND u.stable_user_id IS NOT NULL
-						AND u.stable_user_id != ?
-					ORDER BY u.stable_user_id ASC
-					LIMIT ?`,
+						AND u.stable_user_id != ?${andLiveDeletedAtSql()}
+					ORDER BY u.stable_user_id ASC LIMIT ?`,
 				)
 				.bind(systemEmailOwnerId, input.limit)
 				.all<{ userId: string }>()

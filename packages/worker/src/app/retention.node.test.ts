@@ -46,6 +46,7 @@ function createRetentionDb() {
 			entity_id TEXT NOT NULL,
 			repo_id TEXT NOT NULL,
 			published_commit TEXT,
+			deleted_at TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
@@ -571,6 +572,51 @@ test('published bundle artifact retention deletes stale rows, KV blobs, and sour
 		'artifact-current',
 		'artifact-fresh',
 		'artifact-session',
+	])
+})
+
+test('published bundle retention keeps artifacts while entity_sources are soft-deleted', async () => {
+	const { sqlite, db } = createRetentionDb()
+	const kvDelete = vi.fn(async () => undefined)
+	const env = {
+		APP_DB: db,
+		BUNDLE_ARTIFACTS_KV: { delete: kvDelete },
+		REPO_SESSION_INDEX:
+			createInMemoryRepoSessionIndexEnv(db).REPO_SESSION_INDEX,
+	} as unknown as Pick<Env, 'APP_DB' | 'BUNDLE_ARTIFACTS_KV'>
+	insertRows(sqlite, 'entity_sources', entitySourceColumns, [
+		entitySourceRow('source-tombstone', 'commit-old'),
+	])
+	sqlite
+		.prepare(
+			`UPDATE entity_sources SET deleted_at = ? WHERE id = 'source-tombstone'`,
+		)
+		.run(daysAgo(1))
+	insertRows(sqlite, 'published_bundle_artifacts', artifactColumns, [
+		artifactRow(
+			'artifact-restore-window',
+			'source-tombstone',
+			'commit-old',
+			publishedBundleArtifactRetentionDays + 1,
+		),
+	])
+
+	expect(
+		await prunePublishedBundleArtifactsForRetention({
+			env,
+			now,
+			batchSize: 10,
+		}),
+	).toEqual({
+		deletedRows: 0,
+		deletedKvKeys: 0,
+		deletedSnapshotKvKeys: 0,
+		kvDeleteErrors: 0,
+		hasMore: false,
+	})
+	expect(kvDelete).not.toHaveBeenCalled()
+	expect(selectColumn(sqlite, 'published_bundle_artifacts', 'id')).toEqual([
+		'artifact-restore-window',
 	])
 })
 

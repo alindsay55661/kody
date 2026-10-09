@@ -11,6 +11,7 @@ export async function ensureSecretBucketsTestSchema(db: D1Database) {
 				scope TEXT NOT NULL CHECK (scope IN ('session', 'package', 'user')),
 				binding_key TEXT NOT NULL,
 				expires_at TEXT,
+				deleted_at TEXT,
 				created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				UNIQUE(user_id, scope, binding_key)
@@ -28,6 +29,7 @@ export async function ensureSecretBucketsTestSchema(db: D1Database) {
 				allowed_packages TEXT NOT NULL DEFAULT '[]',
 				lookup_hash TEXT,
 				expires_at TEXT,
+				deleted_at TEXT,
 				created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				PRIMARY KEY (bucket_id, name)
@@ -42,6 +44,7 @@ export async function ensureSecretBucketsTestSchema(db: D1Database) {
 				package_id TEXT NOT NULL,
 				door_secret_name TEXT NOT NULL,
 				config_json TEXT NOT NULL DEFAULT '{}',
+				deleted_at TEXT,
 				created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
 				PRIMARY KEY (user_id, provider_id)

@@ -1,3 +1,9 @@
+/**
+ * soft-delete-read-filter: opt-out
+ *
+ * Published-bundle retention must treat soft-deleted entity_sources as still
+ * present so restore-window artifacts are not pruned before hard purge.
+ */
 import { accountRetentionDispositions } from '#app/account-retention-dispositions.ts'
 import { runD1WithRetry } from '#worker/d1-retry.ts'
 import { agentPackagePopularityMaxAgeDays } from '#worker/usage/agent-package-conversation-uses.ts'
@@ -370,8 +376,7 @@ export async function prunePublishedBundleArtifactsForRetention(input: {
 					AND source.id = artifact.source_id
 					AND source.published_commit = artifact.published_commit
 			)
-		ORDER BY artifact.created_at ASC, artifact.id ASC
-		LIMIT ?`,
+		ORDER BY artifact.created_at ASC, artifact.id ASC LIMIT ?`,
 		)
 			.bind(cutoff, batchSize)
 			.all<{

@@ -1,4 +1,5 @@
 import { errorCauseChainIncludes } from '@kody-internal/shared/error-message.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 
 export type PublishedBundleArtifactRecord = {
 	id: string
@@ -153,6 +154,7 @@ export async function countStaticDependentBundleArtifactPackages(
 					AND artifact.published_commit = source.published_commit
 					AND json_extract(dependency.value, '$.sourceId') = ?
 					AND json_extract(dependency.value, '$.transitive') IS NULL
+					${andLiveDeletedAtSql('source')}${andLiveDeletedAtSql('p')}
 			)
 			SELECT
 				COUNT(DISTINCT package_id) AS total_packages,
@@ -215,6 +217,7 @@ export async function listStaticDependentBundleArtifactRows(
 					AND artifact.published_commit = source.published_commit
 					AND json_extract(dependency.value, '$.sourceId') = ?
 					AND json_extract(dependency.value, '$.transitive') IS NULL
+					${andLiveDeletedAtSql('source')}${andLiveDeletedAtSql('p')}
 			),
 			package_rollup AS (
 				SELECT
@@ -357,7 +360,7 @@ async function getLivePublishedCommit(
 			.prepare(
 				`SELECT published_commit FROM entity_sources
 				WHERE id = ? AND user_id = ?
-				LIMIT 1`,
+				${andLiveDeletedAtSql()} LIMIT 1`,
 			)
 			.bind(input.sourceId, input.userId)
 			.first<Record<string, unknown>>()

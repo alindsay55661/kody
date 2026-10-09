@@ -42,6 +42,7 @@ import {
 	tipsUnsubscribeLabel,
 } from '#worker/usage/tips-unsubscribe.ts'
 
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 export type UserUsageCampaignEmailResult =
 	| { status: 'skipped'; reason: 'no_email_config' }
 	| { status: 'no_sends'; evaluatedUsers: number }
@@ -275,9 +276,8 @@ export async function listUsersForUsageCampaignSweep(
 			   AND u.deleting_at IS NULL
 			   AND u.suspended_at IS NULL
 			   AND u.email_outbound_paused_at IS NULL
-			   AND u.account_type = 'person'
-			 ORDER BY COALESCE(c.last_evaluated_at, '') ASC, u.stable_user_id ASC
-			 LIMIT ?`,
+			   AND u.account_type = 'person'${andLiveDeletedAtSql()}
+			 ORDER BY COALESCE(c.last_evaluated_at, '') ASC, u.stable_user_id ASC LIMIT ?`,
 		)
 		.bind(limit)
 		.all<UsageCampaignCandidate>()

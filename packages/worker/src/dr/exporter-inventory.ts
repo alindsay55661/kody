@@ -1,6 +1,7 @@
 import { type JobsStore } from '@kody-internal/shared/jobs/store.ts'
 import { listPlatformStorageBuckets } from '#worker/storage-buckets/service.ts'
 import { encodeStorageIdentity } from '#worker/dr/storage-identity.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 
 export type StorageInventoryEntry = {
 	userId: string
@@ -23,7 +24,7 @@ export async function listPlatformOwnerInventory(
 		.prepare(
 			`SELECT stable_user_id AS ownerId
 			FROM users
-			WHERE deleting_at IS NULL
+			WHERE deleting_at IS NULL${andLiveDeletedAtSql()}
 			ORDER BY stable_user_id ASC`,
 		)
 		.all<{ ownerId: string }>()
@@ -73,7 +74,7 @@ export async function listPlatformArtifactInventory(
 			`SELECT id AS sourceId, user_id AS userId, entity_kind AS entityKind,
 				entity_id AS entityId, published_commit AS publishedCommit
 			FROM entity_sources
-			WHERE published_commit IS NOT NULL AND trim(published_commit) != ''
+			WHERE published_commit IS NOT NULL AND trim(published_commit) != ''${andLiveDeletedAtSql()}
 			ORDER BY id ASC`,
 		)
 		.all<ArtifactInventoryEntry>()

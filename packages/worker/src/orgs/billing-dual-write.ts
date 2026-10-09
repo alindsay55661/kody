@@ -2,6 +2,8 @@
  * P3 dual-write: billing and entitlement columns stay on `users` until the
  * contract moves; mirror writes onto `orgs` where org id = stable_user_id.
  */
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
+
 /**
  * Bind order: SET `values`, then the org id (`WHERE id = ?`), then
  * `orgWhereValues` for any `?` placeholders in `orgWhereSuffix`.
@@ -15,7 +17,9 @@ export function preparePersonalOrgBillingUpdate(
 	orgWhereValues: ReadonlyArray<unknown> = [],
 ) {
 	return db
-		.prepare(`UPDATE orgs SET ${setClause} WHERE id = ?${orgWhereSuffix}`)
+		.prepare(
+			`UPDATE orgs SET ${setClause} WHERE id = ?${andLiveDeletedAtSql()}${orgWhereSuffix}`,
+		)
 		.bind(...values, stableUserId, ...orgWhereValues)
 }
 

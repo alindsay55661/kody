@@ -45,6 +45,7 @@ import {
 } from '#worker/repo/repo-session-index-client.ts'
 import { type RepoSessionIndexExportResult } from '#worker/repo/repo-session-index-do.ts'
 import { listAccountUserStorageIds } from '#worker/account/user-inventory.ts'
+import { andLiveDeletedAtSql } from '#worker/soft-delete/live-sql.ts'
 
 const accountExportSchemaVersion = 1
 const defaultExportPageSize = 100
@@ -862,9 +863,8 @@ async function countUserBundleKvKeys(input: {
 		const page = await input.env.APP_DB.prepare(
 			`SELECT id, published_commit
 			FROM entity_sources
-			WHERE user_id = ? AND id > ?
-			ORDER BY id
-			LIMIT 100`,
+			WHERE user_id = ? AND id > ?${andLiveDeletedAtSql()}
+			ORDER BY id LIMIT 100`,
 		)
 			.bind(input.userId, afterId)
 			.all<{ id: string; published_commit: string | null }>()
@@ -1647,7 +1647,7 @@ export async function resolveAccountExportDbUserId(input: {
 		throw new Error('Account export requires an authenticated user email.')
 	}
 	const row = await input.env.APP_DB.prepare(
-		`SELECT id, email, stable_user_id FROM users WHERE email = ?`,
+		`SELECT id, email, stable_user_id FROM users WHERE email = ?${andLiveDeletedAtSql()}`,
 	)
 		.bind(email)
 		.first<{ id: number; email: string; stable_user_id: string }>()
