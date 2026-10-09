@@ -203,6 +203,50 @@ jobs:
           fi
           rm -f "$PATH_FILTER_LIST"
 
+  # Cloudflare token split (#2010). CLOUDFLARE_API_TOKEN is the deploy token:
+  # wrangler and tools/ci authenticate with it, and it is never uploaded to a
+  # Worker. Each Worker's CLOUDFLARE_API_TOKEN secret comes from its own
+  # narrower GitHub secret, overwritten on every sync so no Worker keeps a
+  # stale deploy-scope value:
+  #   kody-production, kody-platform <- CLOUDFLARE_APP_API_TOKEN
+  #   kody-runtime                   <- CLOUDFLARE_RUNTIME_API_TOKEN
+  #   kody-status                    <- CLOUDFLARE_STATUS_API_TOKEN
+  # There is no fallback to the deploy token. Run this before any production
+  # mutation (including jobs/highlight siblings) so a missing token fails the
+  # deploy instead of leaving the fleet half-applied.
+  require-worker-tokens:
+    runs-on: ubuntu-latest
+    name: 🔒 Require Worker-scoped Cloudflare tokens
+    timeout-minutes: 2
+    needs: sha-guard
+    if: needs.sha-guard.outputs.should_deploy == 'true'
+    environment:
+      name: production
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.sha-guard.outputs.deploy_sha }}
+          fetch-depth: 1
+
+      - name: 🟢 Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 26
+
+      - name: 🔒 Check Worker-scoped Cloudflare tokens
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_APP_API_TOKEN: ${{ secrets.CLOUDFLARE_APP_API_TOKEN }}
+          CLOUDFLARE_RUNTIME_API_TOKEN:
+            ${{ secrets.CLOUDFLARE_RUNTIME_API_TOKEN }}
+          CLOUDFLARE_STATUS_API_TOKEN:
+            ${{ secrets.CLOUDFLARE_STATUS_API_TOKEN }}
+        run: >
+          node tools/ci/check-worker-cloudflare-tokens.ts
+          CLOUDFLARE_APP_API_TOKEN CLOUDFLARE_RUNTIME_API_TOKEN
+          CLOUDFLARE_STATUS_API_TOKEN
+
   # The jobs worker deploys before origin so origin's JOBS service binding
   # can validate against an existing jobs-worker script. See
   # docs/contributing/architecture/jobs-worker-migration-runbook.md.
@@ -210,10 +254,13 @@ jobs:
     runs-on: ubuntu-latest
     name: 🎨 Deploy highlight worker
     timeout-minutes: 8
-    needs: sha-guard
+    needs:
+      - sha-guard
+      - require-worker-tokens
     if: >-
       needs.sha-guard.outputs.should_deploy == 'true' &&
-      needs.sha-guard.outputs.deploy_highlight == 'true'
+      needs.sha-guard.outputs.deploy_highlight == 'true' &&
+      needs.require-worker-tokens.result == 'success'
     environment:
       name: production
     steps:
@@ -303,10 +350,13 @@ jobs:
     runs-on: ubuntu-latest
     name: ⏰ Deploy jobs worker
     timeout-minutes: 8
-    needs: sha-guard
+    needs:
+      - sha-guard
+      - require-worker-tokens
     if: >-
       needs.sha-guard.outputs.should_deploy == 'true' &&
-      needs.sha-guard.outputs.deploy_jobs == 'true'
+      needs.sha-guard.outputs.deploy_jobs == 'true' &&
+      needs.require-worker-tokens.result == 'success'
     environment:
       name: production
     steps:
@@ -440,10 +490,12 @@ jobs:
     timeout-minutes: 20
     needs:
       - sha-guard
+      - require-worker-tokens
       - deploy-jobs-worker
       - deploy-highlight-worker
     if: >-
       always() && !cancelled() && needs.sha-guard.result == 'success' &&
+      needs.require-worker-tokens.result == 'success' &&
       needs.sha-guard.outputs.should_deploy == 'true' &&
       (needs.deploy-jobs-worker.result == 'success' ||
         needs.deploy-jobs-worker.result == 'skipped') &&
@@ -535,6 +587,7 @@ jobs:
       - name: 🔐 Sync Cloudflare Secrets (bulk)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_APP_API_TOKEN: ${{ secrets.CLOUDFLARE_APP_API_TOKEN }}
           WRANGLER_CONFIG: ${{ steps.resources.outputs.wrangler_config }}
           COOKIE_SECRET: ${{ secrets.COOKIE_SECRET }}
           SECRET_STORE_KEY: ${{ secrets.SECRET_STORE_KEY }}
@@ -567,8 +620,8 @@ jobs:
           node tools/ci/sync-worker-secrets.ts --env production --config
           "$WRANGLER_CONFIG" --set-from-env COOKIE_SECRET
           --set-from-env-optional SECRET_STORE_KEY --set-from-env-optional
-          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN
-          --set-from-env-optional CLOUDFLARE_API_TOKEN --set-from-env-optional
+          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN --set-from-env
+          CLOUDFLARE_API_TOKEN=CLOUDFLARE_APP_API_TOKEN --set-from-env-optional
           CAPABILITY_REINDEX_SECRET --set-from-env-optional GITHUB_CLIENT_ID
           --set-from-env-optional GITHUB_CLIENT_SECRET --set-from-env-optional
           GOOGLE_CLIENT_ID --set-from-env-optional GOOGLE_CLIENT_SECRET
@@ -593,8 +646,8 @@ jobs:
       # runtime-Worker compromise cannot reach them.
       # The runtime Worker's CLOUDFLARE_API_TOKEN comes from the narrower
       # CLOUDFLARE_RUNTIME_API_TOKEN GitHub secret (Email Sending + Artifacts
-      # only; see docs/contributing/environment-variables.md). It falls back
-      # to the deploy token until that secret exists.
+      # only; see docs/contributing/environment-variables.md). It is required
+      # and never falls back to the deploy token.
       # --env "" with --name: wrangler secret bulk still suffixes -<env>
       # even when --name is set, so --env production would write
       # COOKIE_SECRET to kody-runtime-production while deploy uploads
@@ -606,8 +659,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_RUNTIME_API_TOKEN:
-            ${{ secrets.CLOUDFLARE_RUNTIME_API_TOKEN ||
-            secrets.CLOUDFLARE_API_TOKEN }}
+            ${{ secrets.CLOUDFLARE_RUNTIME_API_TOKEN }}
           WRANGLER_CONFIG:
             ${{ steps.runtime_config.outputs.runtime_wrangler_config }}
           COOKIE_SECRET: ${{ secrets.COOKIE_SECRET }}
@@ -618,8 +670,7 @@ jobs:
           node tools/ci/sync-worker-secrets.ts --env "" --name kody-runtime
           --config "$WRANGLER_CONFIG" --set-from-env COOKIE_SECRET
           --set-from-env-optional SECRET_STORE_KEY --set-from-env-optional
-          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN
-          --set-from-env-optional
+          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN --set-from-env
           CLOUDFLARE_API_TOKEN=CLOUDFLARE_RUNTIME_API_TOKEN
 
       # Platform worker is trusted (same secret set as origin): MCP Durable
@@ -631,6 +682,7 @@ jobs:
           steps.resources.outputs.origin_deploy_mode == 'fresh'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_APP_API_TOKEN: ${{ secrets.CLOUDFLARE_APP_API_TOKEN }}
           WRANGLER_CONFIG:
             ${{ steps.platform_config.outputs.platform_wrangler_config }}
           COOKIE_SECRET: ${{ secrets.COOKIE_SECRET }}
@@ -663,8 +715,8 @@ jobs:
           node tools/ci/sync-worker-secrets.ts --env "" --name kody-platform
           --config "$WRANGLER_CONFIG" --set-from-env COOKIE_SECRET
           --set-from-env-optional SECRET_STORE_KEY --set-from-env-optional
-          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN
-          --set-from-env-optional CLOUDFLARE_API_TOKEN --set-from-env-optional
+          AI_GATEWAY_ID --set-from-env-optional SENTRY_DSN --set-from-env
+          CLOUDFLARE_API_TOKEN=CLOUDFLARE_APP_API_TOKEN --set-from-env-optional
           CAPABILITY_REINDEX_SECRET --set-from-env-optional GITHUB_CLIENT_ID
           --set-from-env-optional GITHUB_CLIENT_SECRET --set-from-env-optional
           GOOGLE_CLIENT_ID --set-from-env-optional GOOGLE_CLIENT_SECRET
@@ -1149,16 +1201,20 @@ jobs:
     # /health/components), which would open spurious incidents.
     needs:
       - sha-guard
+      - require-worker-tokens
       - deploy
     # always() is required: `deploy` itself uses always() so it can run
     # after skipped jobs/highlight siblings. Without always() here, GitHub
     # skips this job whenever those siblings were skipped — even when the
     # path filter set deploy_status_worker=true (see #2143: guard matched
     # packages/status/ but this job never started).
+    # require-worker-tokens already gated STATUS (and APP/RUNTIME) before any
+    # sibling mutation; re-check here only if that job somehow did not run.
     if: >-
       always() && !cancelled() && needs.sha-guard.result == 'success' &&
-      needs.deploy.result == 'success' && needs.sha-guard.outputs.should_deploy
-      == 'true' && needs.sha-guard.outputs.deploy_status_worker == 'true'
+      needs.require-worker-tokens.result == 'success' && needs.deploy.result ==
+      'success' && needs.sha-guard.outputs.should_deploy == 'true' &&
+      needs.sha-guard.outputs.deploy_status_worker == 'true'
     environment:
       name: production
       url: https://status.kody.codes
@@ -1211,11 +1267,18 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_STATUS_API_TOKEN:
+            ${{ secrets.CLOUDFLARE_STATUS_API_TOKEN }}
         run: |
           set -euo pipefail
           # The status worker sends alert email through the Cloudflare Email
-          # REST API using the same account token the deploy uses.
-          printf '%s' "$CLOUDFLARE_API_TOKEN" | npx wrangler secret put \
+          # REST API. Wrangler authenticates with the deploy token; the Worker
+          # secret is the Email Sending-only CLOUDFLARE_STATUS_API_TOKEN.
+          if [ -z "${CLOUDFLARE_STATUS_API_TOKEN:-}" ]; then
+            echo "Missing GitHub Actions secret CLOUDFLARE_STATUS_API_TOKEN." >&2
+            exit 1
+          fi
+          printf '%s' "$CLOUDFLARE_STATUS_API_TOKEN" | npx wrangler secret put \
             CLOUDFLARE_API_TOKEN --config packages/status/wrangler.jsonc
 
       - name: 🔐 Sync status incident event secret
@@ -1271,11 +1334,15 @@ jobs:
     # The KODY_API service binding targets the origin's KodyApi entrypoint,
     # so this deploys after origin. `deploy` may be skipped when only the
     # edge worker changed; the binding then targets the live origin.
+    # require-worker-tokens must succeed: when that job fails, `deploy` is
+    # skipped (not failed), and skipped must not greenlight an API rollout.
     needs:
       - sha-guard
+      - require-worker-tokens
       - deploy
     if: >-
       always() && !cancelled() && needs.sha-guard.result == 'success' &&
+      needs.require-worker-tokens.result == 'success' &&
       needs.sha-guard.outputs.should_deploy == 'true' &&
       needs.sha-guard.outputs.deploy_api_worker == 'true' &&
       (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
@@ -1373,11 +1440,15 @@ jobs:
     # Independent of origin: docs fetch the live OpenAPI JSON over HTTPS.
     # Deploys after the API worker when that job ran, so a brand-new API
     # hostname is live before docs proxy it; skipped API deploys are fine.
+    # Same require-worker-tokens gate as API: a token failure must not leave
+    # docs deploying while origin/API stay rolled back.
     needs:
       - sha-guard
+      - require-worker-tokens
       - deploy-api-worker
     if: >-
       always() && !cancelled() && needs.sha-guard.result == 'success' &&
+      needs.require-worker-tokens.result == 'success' &&
       needs.sha-guard.outputs.should_deploy == 'true' &&
       needs.sha-guard.outputs.deploy_api_docs_worker == 'true' &&
       (needs.deploy-api-worker.result == 'success' ||
